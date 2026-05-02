@@ -1,294 +1,247 @@
 import asyncio
-import json
 import logging
 import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 
 # =========================
-# config
+# CONFIG
 # =========================
 
 token = os.getenv("DISCORD_TOKEN")
-
 api_url = "https://api.geode-sdk.org/v1/mods/{}"
-state_file = Path("geode_version_state.json")
-check_interval_minutes = 15
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("geode-bot")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("geode")
 
-version_re = re.compile(r"^\s*v?(\d+(?:\.\d+)+(?:[-+][\w.]+)?)\s*$", re.IGNORECASE)
+version_re = re.compile(r"v?(\d+(?:\.\d+)+)", re.IGNORECASE)
 
 # =========================
-# tracked mods
+# MODS (ONLY 4)
 # =========================
 
 @dataclass(frozen=True)
-class TrackedMod:
+class Mod:
     id: str
-    label: str
+    name: str
     emoji: str
 
 
-tracked_mods = (
-    TrackedMod("axiom.echochoke", "EchoChoke", "🟣"),
-    TrackedMod("axiom.echoclip", "EchoClip", "🔴"),
-    TrackedMod("axiom.voicecontrol", "Voice Control", "🔵"),
-    TrackedMod("axiom.cube-abuse", "Cube Abuse", "🟡"),
+MODS = (
+    Mod("axiom.echochoke", "EchoChoke", "🟣"),
+    Mod("axiom.echoclip", "EchoClip", "🔴"),
+    Mod("axiom.voicecontrol", "Voice Control", "🔵"),
+    Mod("axiom.cube-abuse", "Cube Abuse", "🟡"),
 )
 
 # =========================
-# helpers
+# HELPERS
 # =========================
 
-def utc_now():
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def strip_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text or "")
+def strip(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s or "")
 
 
-def first_text(data: dict, keys):
+def get_text(d: dict, keys):
     for k in keys:
-        v = data.get(k)
+        v = d.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
 
 
-def unwrap(data):
+def unwrap(data: Any) -> dict:
     if isinstance(data, dict) and isinstance(data.get("payload"), dict):
         return data["payload"]
     return data if isinstance(data, dict) else {}
 
 
 # =========================
-# FIXED pending detection
+# PENDING DETECTION (FIXED)
 # =========================
 
-def is_pending(data: dict) -> bool:
-    if not isinstance(data, dict):
+def is_pending(d: dict) -> bool:
+    if not isinstance(d, dict):
         return False
 
-    # direct flags
     for k in ("pending", "isPending", "is_pending"):
-        if isinstance(data.get(k), bool):
-            return data[k]
+        if isinstance(d.get(k), bool):
+            return d[k]
 
-    # status string detection
-    status = first_text(data, ("status", "state"))
+    status = get_text(d, ("status",))
     if status and "pending" in status.lower():
         return True
 
-    # tags / categories
-    tags = data.get("tags") or data.get("categories")
-    if isinstance(tags, list):
-        joined = " ".join(map(str, tags)).lower()
-        if "pending" in joined or "beta" in joined:
-            return True
-
-    # description / changelog fallback
-    text = first_text(data, ("changelog", "description", "notes"))
-    if text and ("pending" in text.lower() or "not released" in text.lower()):
+    text = get_text(d, ("description", "changelog", "notes"))
+    if text and "pending" in text.lower():
         return True
 
     return False
 
 
-def is_released(data: dict, pending: bool, version: Optional[str]) -> bool:
-    if isinstance(data.get("released"), bool):
-        return data["released"]
-    return bool(version) and not pending
+# =========================
+# VERSION EXTRACTION (ROBUST)
+# =========================
 
+def find_version(d: dict) -> Optional[str]:
+    if not isinstance(d, dict):
+        return None
 
-def extract(mod: TrackedMod, data: dict):
-    name = first_text(data, ("name", "title")) or mod.label
-    version = first_text(data, ("version", "latestVersion", "currentVersion"))
+    for k in ("version", "latestVersion", "currentVersion"):
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
 
-    pending = is_pending(data)
-    released = is_released(data, pending, version)
+    # nested search
+    for k, v in d.items():
+        if isinstance(v, dict):
+            res = find_version(v)
+            if res:
+                return res
 
-    return {
-        "id": mod.id,
-        "name": name,
-        "version": version or "unknown",
-        "pending": pending,
-        "released": released,
-        "raw": data,
-    }
+    text = get_text(d, ("changelog", "description"))
+    if text:
+        m = version_re.search(text)
+        if m:
+            return m.group(1)
+
+    return None
 
 
 # =========================
-# bot
+# BOT
 # =========================
 
 class Bot(commands.Bot):
     def __init__(self):
-        intents = discord.Intents.default()
-        super().__init__(command_prefix="!", intents=intents)
-
+        super().__init__(command_prefix="!", intents=discord.Intents.default())
         self.session: Optional[aiohttp.ClientSession] = None
-        self.last = {}
-
-        self.state = self.load_state()
-
-    # -------------------------
-    # lifecycle
-    # -------------------------
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
-
-        # IMPORTANT: this is what fixes "commands don't exist"
         await self.tree.sync()
         log.info("slash commands synced")
-
-        self.poll.start()
-
-    async def on_ready(self):
-        log.info(f"logged in as {self.user}")
 
     async def close(self):
         if self.session:
             await self.session.close()
         await super().close()
 
-    # -------------------------
-    # api
-    # -------------------------
+    # =========================
+    # LIVE FETCH (ALWAYS FRESH)
+    # =========================
 
-    async def fetch_one(self, mod: TrackedMod):
+    async def fetch_mod(self, mod: Mod):
         try:
             async with self.session.get(api_url.format(mod.id)) as r:
-                data = await r.json(content_type=None)
-                data = unwrap(data)
-                return mod.id, extract(mod, data)
+                data = unwrap(await r.json(content_type=None))
+                version = find_version(data)
+                pending = is_pending(data)
+
+                released = bool(version) and not pending
+
+                return {
+                    "mod": mod,
+                    "version": version or "unknown",
+                    "pending": pending,
+                    "released": released,
+                    "raw": data,
+                }
         except Exception as e:
-            return mod.id, {
-                "id": mod.id,
-                "name": mod.label,
+            return {
+                "mod": mod,
                 "version": "error",
                 "pending": False,
                 "released": False,
-                "error": str(e),
+                "raw": {"error": str(e)},
             }
 
     async def fetch_all(self):
-        return dict(await asyncio.gather(*(self.fetch_one(m) for m in tracked_mods)))
+        return await asyncio.gather(*(self.fetch_mod(m) for m in MODS))
 
-    # -------------------------
-    # state
-    # -------------------------
+    # =========================
+    # EMBED
+    # =========================
 
-    def load_state(self):
-        if not state_file.exists():
-            return {"mods": {}}
-        try:
-            return json.loads(state_file.read_text())
-        except:
-            return {"mods": {}}
-
-    def save_state(self):
-        state_file.write_text(json.dumps(self.state, indent=2))
-
-    # -------------------------
-    # loop
-    # -------------------------
-
-    @tasks.loop(minutes=check_interval_minutes)
-    async def poll(self):
-        snaps = await self.fetch_all()
-
-        mods = self.state.setdefault("mods", {})
-
-        for k, v in snaps.items():
-            if v.get("pending"):
-                continue
-
-            old = mods.get(k)
-            if not old or old.get("version") != v.get("version"):
-                mods[k] = {
-                    "version": v.get("version"),
-                    "saved_at": utc_now(),
-                }
-
-        self.save_state()
-        self.last = snaps
-
-    # -------------------------
-    # embeds
-    # -------------------------
-
-    def build_embed(self, snaps):
+    def build_embed(self, results):
         e = discord.Embed(
-            title="geode mod tracker",
+            title="geode version checker",
             color=discord.Color.blurple(),
             timestamp=datetime.now(timezone.utc),
         )
 
         lines = []
-        for m in tracked_mods:
-            s = snaps.get(m.id, {})
-            status = "⏳ pending" if s.get("pending") else "✅ released"
-            lines.append(f"{m.emoji} **{m.label}** — `{s.get('version')}` • {status}")
+
+        for r in results:
+            m = r["mod"]
+
+            if r["pending"]:
+                status = "⏳ pending"
+            elif r["version"] in ("unknown", "error") or not r["version"]:
+                status = "❓ unknown"
+            else:
+                status = "✅ released"
+
+            lines.append(
+                f"{m.emoji} **{m.name}** — `{r['version']}` • {status}"
+            )
 
         e.description = "\n".join(lines)
+        e.set_footer(text="live api data (no cache)")
         return e
 
 
 bot = Bot()
 
 # =========================
-# slash commands (FIXED)
+# SLASH COMMANDS (FIXED)
 # =========================
 
-@bot.tree.command(name="checkforupdates", description="check geode mods")
+@bot.tree.command(name="checkforupdates", description="live geode mod status")
 async def checkforupdates(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    snaps = await bot.fetch_all()
-    await interaction.followup.send(embed=bot.build_embed(snaps))
+    data = await bot.fetch_all()
+    await interaction.followup.send(embed=bot.build_embed(data))
 
 
-@bot.tree.command(name="debugmods", description="raw api debug")
+@bot.tree.command(name="debugmods", description="raw api output (live)")
 async def debugmods(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    snaps = await bot.fetch_all()
-    await interaction.followup.send(
-        "\n".join(f"{k}: {v.get('raw')}" for k, v in snaps.items())[:1900]
-    )
+    data = await bot.fetch_all()
+
+    out = ""
+    for r in data:
+        out += f"\n\n=== {r['mod'].name} ===\n{r['raw']}"
+
+    await interaction.followup.send(out[:1900])
 
 
-@bot.tree.command(name="debugstate", description="saved json state")
+@bot.tree.command(name="debugstate", description="not used anymore (live only)")
 async def debugstate(interaction: discord.Interaction):
     await interaction.response.defer()
-
-    await interaction.followup.send(
-        f"```json\n{json.dumps(bot.state, indent=2)[:1900]}```"
-    )
+    await interaction.followup.send("state disabled — everything is live now")
 
 
 # =========================
-# run
+# RUN
 # =========================
 
 def main():
     if not token:
-        raise RuntimeError("missing DISCORD_TOKEN")
+        raise RuntimeError("DISCORD_TOKEN missing")
     bot.run(token)
 
 
