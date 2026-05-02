@@ -11,7 +11,7 @@ from discord.ext import commands, tasks
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-API_URL = "https://api.geode-sdk.org/v1/mods"
+API_URL = "https://api.geode-sdk.org/v1/mods/{}"
 STATE_FILE = Path("geode_version_state.json")
 CHECK_INTERVAL_MINUTES = 15
 TRACKED_MOD_IDS = (
@@ -391,31 +391,33 @@ class GeodeVersionBot(commands.Bot):
             response.raise_for_status()
             return await response.json(content_type=None)
 
-    async def fetch_snapshots(self) -> dict[str, dict[str, Any]]:
-        payload = await self.fetch_api_payload()
-        snapshots: dict[str, dict[str, Any]] = {}
+async def fetch_snapshots(self) -> dict[str, dict[str, Any]]:
+    snapshots = {}
 
-        for mod_id in TRACKED_MOD_IDS:
-            mod_node = find_mod_node(payload, mod_id)
-            if mod_node:
-                snapshots[mod_id] = extract_mod_snapshot(mod_id, mod_node)
-            else:
-                snapshots[mod_id] = {
-                    "id": mod_id,
-                    "name": mod_id,
-                    "author": None,
-                    "version": None,
-                    "display_version": "unknown",
-                    "pending": False,
-                    "released": False,
-                    "status": "not found",
-                    "release_date": None,
-                    "raw": None,
-                    "version_candidates": [],
-                    "parse_failed": True,
-                }
+    for mod_id in TRACKED_MOD_IDS:
+        try:
+            async with self.session.get(API_URL.format(mod_id)) as res:
+                if res.status != 200:
+                    snapshots[mod_id] = {
+                        "error": f"http {res.status}",
+                        "raw": await res.text()
+                    }
+                    continue
 
-        return snapshots
+                data = await res.json(content_type=None)
+
+                snapshot = extract_mod_snapshot(mod_id, data)
+                snapshot["raw"] = data
+
+                snapshots[mod_id] = snapshot
+
+        except Exception as e:
+            snapshots[mod_id] = {
+                "error": str(e),
+                "raw": {}
+            }
+
+    return snapshots
 
     def apply_snapshot_to_state(self, snapshots: dict[str, dict[str, Any]]) -> list[str]:
         changed: list[str] = []
