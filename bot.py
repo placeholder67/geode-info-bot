@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,176 +13,314 @@ import discord
 from discord.ext import commands, tasks
 
 token = os.getenv("DISCORD_TOKEN")
-
 api_url = "https://api.geode-sdk.org/v1/mods/{}"
 state_file = Path("geode_version_state.json")
 check_interval_minutes = 15
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("geode-checker")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("geode-version-checker")
 
+version_re = re.compile(r"^\s*v?(\d+(?:\.\d+)+(?:[-+][\w.]+)?)\s*$", re.IGNORECASE)
 
-# ───────────────────────────────
-# tracked mods (edit here only)
-# ───────────────────────────────
+BOT_INFO = (
+    "tracking geode mods:\n"
+    "- axiom.echochoke\n"
+    "- axiom.echoclip\n"
+    "- axiom.voice control\n"
+    "- axiom.cube-abuse\n"
+)
+
 @dataclass(frozen=True)
-class Mod:
+class TrackedMod:
     id: str
-    name: str
+    label: str
     emoji: str
 
 
-tracked_mods = (
-    Mod("axiom.echochoke", "echochoke", "🟣"),
-    Mod("axiom.echoclip", "echoclip", "🔴"),
-    Mod("axiom.voicecontrol", "voice control", "🔵"),
-    Mod("axiom.cube-abuse", "cube abuse", "🟡"),
+tracked_mods: tuple[TrackedMod, ...] = (
+    TrackedMod("axiom.echochoke", "echochoke", "🟣"),
+    TrackedMod("axiom.echoclip", "echoclip", "🔴"),
+    TrackedMod("axiom.voicecontrol", "voice control", "🔵"),
+    TrackedMod("axiom.cube-abuse", "cube abuse", "🟡"),
 )
 
 
-# ───────────────────────────────
-# helpers
-# ───────────────────────────────
-def now():
+def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def clean(s: str | None):
-    return (s or "").strip() or None
+def strip_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text or "")
 
 
-def load_state():
+def version_from_changelog(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    for line in strip_tags(text).splitlines():
+        m = version_re.match(line.strip())
+        if m:
+            return m.group(1)
+    return None
+
+
+def first_text(data: Any, keys: tuple[str, ...]) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, (int, float, bool)):
+            return str(v)
+    return None
+
+
+def first_bool(data: Any, keys: tuple[str, ...]) -> Optional[bool]:
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        if key not in data:
+            continue
+        v = data.get(key)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            t = v.strip().lower()
+            if t in {"true", "1", "yes"}:
+                return True
+            if t in {"false", "0", "no"}:
+                return False
+        if isinstance(v, (int, float)):
+            return bool(v)
+    return None
+
+
+def unwrap_payload(data: Any) -> dict[str, Any]:
+    if isinstance(data, dict):
+        payload = data.get("payload")
+        if isinstance(payload, dict):
+            return payload
+        return data
+    return {}
+
+
+def status_text(snapshot: dict[str, Any]) -> str:
+    if snapshot.get("pending"):
+        return "pending"
+    if snapshot.get("released"):
+        return "released"
+    return snapshot.get("status") or "unknown"
+
+
+def compare_versions(saved: Optional[dict[str, Any]], current: dict[str, Any]) -> str:
+    cur = current.get("display_version") or current.get("version") or "unknown"
+    if not saved:
+        return "new"
+    old = saved.get("display_version") or saved.get("version") or "unknown"
+    if old == cur:
+        return "same"
+    return f"{old} → {cur}"
+
+
+def load_state() -> dict[str, Any]:
     if not state_file.exists():
         return {"mods": {}}
     try:
-        return json.loads(state_file.read_text())
-    except:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"mods": {}}
+        data.setdefault("mods", {})
+        if not isinstance(data["mods"], dict):
+            data["mods"] = {}
+        return data
+    except Exception:
         return {"mods": {}}
 
 
-def save_state(state):
-    state_file.write_text(json.dumps(state, indent=2))
+def save_state(state: dict[str, Any]) -> None:
+    state_file.write_text(json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
-def compare(saved, current):
-    if not saved:
-        return "new"
-    if saved.get("version") == current.get("version"):
-        return "same"
-    return f"{saved.get('version')} → {current.get('version')}"
+def compact_state(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": snapshot.get("version"),
+        "display_version": snapshot.get("display_version"),
+        "saved_at": utc_now_iso(),
+    }
 
 
-# ───────────────────────────────
-# bot
-# ───────────────────────────────
-class Bot(commands.Bot):
-    def __init__(self):
+def extract_snapshot(mod: TrackedMod, data: dict[str, Any]) -> dict[str, Any]:
+    name = first_text(data, ("name", "title", "displayName", "display_name")) or mod.label
+    author = first_text(data, ("author", "developer", "creator", "owner"))
+
+    version = (
+        first_text(data, ("version", "latestVersion", "latest_version", "currentVersion", "current_version"))
+        or version_from_changelog(first_text(data, ("changelog",)))
+    )
+
+    pending = first_bool(data, ("pending", "isPending", "is_pending")) or False
+    released = first_bool(data, ("released", "isReleased", "is_released"))
+    if released is None:
+        released = bool(version) and not pending
+
+    return {
+        "id": mod.id,
+        "label": mod.label,
+        "emoji": mod.emoji,
+        "name": name,
+        "author": author,
+        "version": version,
+        "display_version": f"{version} (pending)" if pending and version else (version or "unknown"),
+        "pending": pending,
+        "released": released,
+        "status": "pending" if pending else "released" if released else "unknown",
+        "raw": data,
+        "parse_failed": not bool(version),
+    }
+
+
+def compact_block(data: Any, limit: int = 700) -> str:
+    try:
+        txt = json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        txt = repr(data)
+    if len(txt) > limit:
+        txt = txt[: limit - 3] + "..."
+    return f"```json\n{txt}\n```"
+
+
+class GeodeVersionBot(commands.Bot):
+    def __init__(self) -> None:
         super().__init__(command_prefix="!", intents=discord.Intents.default())
-        self.session = None
+        self.session: Optional[aiohttp.ClientSession] = None
         self.state = load_state()
+        self.last_snapshot: dict[str, dict[str, Any]] = {}
 
-    async def setup_hook(self):
-        self.session = aiohttp.ClientSession()
-        self.poll.start()
-
-    async def fetch_mod(self, mod: Mod):
+    async def setup_hook(self) -> None:
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20),
+            headers={"User-Agent": "geode-version-checker/1.0"},
+        )
         try:
-            async with self.session.get(api_url.format(mod.id)) as r:
-                if r.status != 200:
-                    return mod.id, {"error": r.status}
+            synced = await self.tree.sync()
+            log.info("synced %d application commands", len(synced))
+        except Exception:
+            log.exception("failed to sync application commands")
 
-                data = await r.json(content_type=None)
+        log.info(BOT_INFO)
 
-                payload = data.get("payload", data)
+        if not self.poll_versions.is_running():
+            self.poll_versions.start()
 
-                version = clean(payload.get("version") or payload.get("latest_version"))
-                pending = "pending" in str(payload).lower()
+    async def close(self) -> None:
+        try:
+            if self.poll_versions.is_running():
+                self.poll_versions.cancel()
+        except Exception:
+            pass
+        if self.session and not self.session.closed:
+            await self.session.close()
+        await super().close()
 
-                return mod.id, {
-                    "name": mod.name,
-                    "version": version or "unknown",
-                    "pending": pending,
-                    "raw": payload,
-                    "parse_failed": version is None,
-                }
+    async def fetch_one(self, mod: TrackedMod) -> tuple[str, dict[str, Any]]:
+        if not self.session:
+            return mod.id, {
+                "error": "http session not ready",
+                "parse_failed": True,
+            }
+
+        try:
+            async with self.session.get(api_url.format(mod.id)) as res:
+                if res.status != 200:
+                    return mod.id, {
+                        "error": f"http {res.status}",
+                        "parse_failed": True,
+                        "raw": await res.text(),
+                    }
+
+                data = unwrap_payload(await res.json(content_type=None))
+                snap = extract_snapshot(mod, data)
+                snap["raw"] = data
+                return mod.id, snap
 
         except Exception as e:
-            return mod.id, {"error": str(e), "parse_failed": True}
+            return mod.id, {
+                "error": str(e),
+                "parse_failed": True,
+                "raw": {},
+            }
 
-    async def fetch_all(self):
-        results = await asyncio.gather(*(self.fetch_mod(m) for m in tracked_mods))
-        return dict(results)
+    async def fetch_snapshots(self) -> dict[str, dict[str, Any]]:
+        pairs = await asyncio.gather(*(self.fetch_one(m) for m in tracked_mods))
+        return dict(pairs)
 
-    def make_embed(self, snaps):
-        saved = self.state.get("mods", {})
-
+    def make_check_embed(self, snapshots: dict[str, dict[str, Any]], error: Optional[str] = None) -> discord.Embed:
         embed = discord.Embed(
-            title="geode version tracker",
-            description=(
-                "**tracked mods:** axiom suite\n"
-                f"**mods:** {len(tracked_mods)}\n"
-                f"**updated:** <t:{int(datetime.now().timestamp())}:R>\n"
-                "\n━━━━━━━━━━━━━━"
-            ),
+            title="geode version checker",
+            description=BOT_INFO + "\n\ncompact live status",
             color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc),
         )
 
+        if error:
+            embed.add_field(name="warning", value=f"`{error}`", inline=False)
+
+        saved = self.state.get("mods", {})
         lines = []
 
-        for m in tracked_mods:
-            s = snaps.get(m.id, {})
-
-            if s.get("error"):
-                lines.append(f"{m.emoji} **{m.name}** — error")
+        for mod in tracked_mods:
+            snap = snapshots.get(mod.id)
+            if not snap:
+                lines.append(f"{mod.emoji} **{mod.label}** — failed")
                 continue
 
-            version = s.get("version", "unknown")
-            change = compare(saved.get(m.id), s)
+            if snap.get("parse_failed"):
+                lines.append(f"{mod.emoji} **{mod.label}** — parse failed")
+                continue
 
-            status = "⏳" if s.get("pending") else "✅"
+            current = snap.get("display_version") or "unknown"
+            status = "⏳ pending" if snap.get("pending") else "✅ released"
+            change = compare_versions(saved.get(mod.id) if isinstance(saved, dict) else None, snap)
 
-            lines.append(
-                f"{m.emoji} **{m.name}** `{version}` {status}\n"
-                f"└ `{change}`"
-            )
+            line = f"{mod.emoji} **{snap.get('name') or mod.label}** — `{current}` • {status}"
+            if change != "same":
+                line += f" • `{change}`"
+            lines.append(line)
 
-        embed.description += "\n" + "\n\n".join(lines)
-
-        embed.set_footer(text="pending mods are not saved to state")
+        embed.description = "\n".join(lines) if lines else "no mods tracked."
+        embed.set_footer(text="pending versions are shown but not saved")
         return embed
 
-    @tasks.loop(minutes=check_interval_minutes)
-    async def poll(self):
-        snaps = await self.fetch_all()
 
-        for k, v in snaps.items():
-            if not v.get("pending") and not v.get("parse_failed"):
-                self.state["mods"][k] = {
-                    "version": v.get("version"),
-                    "saved_at": now(),
-                }
-
-        save_state(self.state)
+bot = GeodeVersionBot()
 
 
-bot = Bot()
+async def safe_defer(interaction: discord.Interaction) -> None:
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+    except Exception:
+        log.exception("failed to defer interaction")
 
 
-@bot.tree.command(name="check")
-async def check(interaction: discord.Interaction):
-    await interaction.response.defer()
-    snaps = await bot.fetch_all()
-    await interaction.followup.send(embed=bot.make_embed(snaps))
+@bot.tree.command(name="checkforupdates", description="check the tracked geode mods for version changes")
+async def checkforupdates(interaction: discord.Interaction) -> None:
+    await safe_defer(interaction)
+    snaps, error = await bot.build_report()
+    await interaction.followup.send(embed=bot.make_check_embed(snaps, error))
 
 
 @bot.event
-async def on_ready():
-    print(f"logged in as {bot.user}")
+async def on_ready() -> None:
+    log.info("logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
 
 
-def main():
+def main() -> None:
     if not token:
-        raise RuntimeError("missing token")
+        raise RuntimeError("DISCORD_TOKEN is not set")
     bot.run(token)
 
 
