@@ -33,6 +33,7 @@ BOT_INFO = (
     "- axiom.cube-abuse\n"
 )
 
+
 @dataclass(frozen=True)
 class TrackedMod:
     id: str
@@ -107,14 +108,6 @@ def unwrap_payload(data: Any) -> dict[str, Any]:
     return {}
 
 
-def status_text(snapshot: dict[str, Any]) -> str:
-    if snapshot.get("pending"):
-        return "pending"
-    if snapshot.get("released"):
-        return "released"
-    return snapshot.get("status") or "unknown"
-
-
 def compare_versions(saved: Optional[dict[str, Any]], current: dict[str, Any]) -> str:
     cur = current.get("display_version") or current.get("version") or "unknown"
     if not saved:
@@ -133,15 +126,16 @@ def load_state() -> dict[str, Any]:
         if not isinstance(data, dict):
             return {"mods": {}}
         data.setdefault("mods", {})
-        if not isinstance(data["mods"], dict):
-            data["mods"] = {}
         return data
     except Exception:
         return {"mods": {}}
 
 
 def save_state(state: dict[str, Any]) -> None:
-    state_file.write_text(json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    state_file.write_text(
+        json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def compact_state(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -176,20 +170,9 @@ def extract_snapshot(mod: TrackedMod, data: dict[str, Any]) -> dict[str, Any]:
         "display_version": f"{version} (pending)" if pending and version else (version or "unknown"),
         "pending": pending,
         "released": released,
-        "status": "pending" if pending else "released" if released else "unknown",
         "raw": data,
         "parse_failed": not bool(version),
     }
-
-
-def compact_block(data: Any, limit: int = 700) -> str:
-    try:
-        txt = json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True)
-    except Exception:
-        txt = repr(data)
-    if len(txt) > limit:
-        txt = txt[: limit - 3] + "..."
-    return f"```json\n{txt}\n```"
 
 
 class GeodeVersionBot(commands.Bot):
@@ -204,42 +187,28 @@ class GeodeVersionBot(commands.Bot):
             timeout=aiohttp.ClientTimeout(total=20),
             headers={"User-Agent": "geode-version-checker/1.0"},
         )
+
         try:
             synced = await self.tree.sync()
-            log.info("synced %d application commands", len(synced))
+            log.info("synced %d commands", len(synced))
         except Exception:
-            log.exception("failed to sync application commands")
+            log.exception("sync failed")
 
         log.info(BOT_INFO)
-
-        if not self.poll_versions.is_running():
-            self.poll_versions.start()
+        self.poll_versions.start()
 
     async def close(self) -> None:
-        try:
-            if self.poll_versions.is_running():
-                self.poll_versions.cancel()
-        except Exception:
-            pass
-        if self.session and not self.session.closed:
+        if self.poll_versions.is_running():
+            self.poll_versions.cancel()
+        if self.session:
             await self.session.close()
         await super().close()
 
     async def fetch_one(self, mod: TrackedMod) -> tuple[str, dict[str, Any]]:
-        if not self.session:
-            return mod.id, {
-                "error": "http session not ready",
-                "parse_failed": True,
-            }
-
         try:
             async with self.session.get(api_url.format(mod.id)) as res:
                 if res.status != 200:
-                    return mod.id, {
-                        "error": f"http {res.status}",
-                        "parse_failed": True,
-                        "raw": await res.text(),
-                    }
+                    return mod.id, {"parse_failed": True, "error": f"http {res.status}"}
 
                 data = unwrap_payload(await res.json(content_type=None))
                 snap = extract_snapshot(mod, data)
@@ -247,26 +216,53 @@ class GeodeVersionBot(commands.Bot):
                 return mod.id, snap
 
         except Exception as e:
-            return mod.id, {
-                "error": str(e),
-                "parse_failed": True,
-                "raw": {},
-            }
+            return mod.id, {"parse_failed": True, "error": str(e)}
 
     async def fetch_snapshots(self) -> dict[str, dict[str, Any]]:
         pairs = await asyncio.gather(*(self.fetch_one(m) for m in tracked_mods))
         return dict(pairs)
 
-    def make_check_embed(self, snapshots: dict[str, dict[str, Any]], error: Optional[str] = None) -> discord.Embed:
+    def apply_snapshot_to_state(self, snapshots: dict[str, dict[str, Any]]) -> list[str]:
+        changed = []
+        mods = self.state.setdefault("mods", {})
+
+        for mod_id, snap in snapshots.items():
+            if snap.get("parse_failed"):
+                continue
+
+            saved = mods.get(mod_id)
+            if not saved or saved.get("version") != snap.get("version"):
+                mods[mod_id] = compact_state(snap)
+                changed.append(mod_id)
+
+        if changed:
+            self.state["last_updated"] = utc_now_iso()
+            save_state(self.state)
+
+        return changed
+
+    async def build_report(self):
+        snaps = await self.fetch_snapshots()
+        return snaps, None
+
+    @tasks.loop(minutes=check_interval_minutes)
+    async def poll_versions(self):
+        snaps = await self.fetch_snapshots()
+        changed = self.apply_snapshot_to_state(snaps)
+        if changed:
+            log.info("updated: %s", ", ".join(changed))
+
+    @poll_versions.before_loop
+    async def before_poll_versions(self):
+        await self.wait_until_ready()
+
+    def make_check_embed(self, snapshots: dict[str, dict[str, Any]], error=None):
         embed = discord.Embed(
             title="geode version checker",
-            description=BOT_INFO + "\n\ncompact live status",
+            description=BOT_INFO + "\n\nstatus:",
             color=discord.Color.blurple(),
             timestamp=datetime.now(timezone.utc),
         )
-
-        if error:
-            embed.add_field(name="warning", value=f"`{error}`", inline=False)
 
         saved = self.state.get("mods", {})
         lines = []
@@ -274,53 +270,45 @@ class GeodeVersionBot(commands.Bot):
         for mod in tracked_mods:
             snap = snapshots.get(mod.id)
             if not snap:
-                lines.append(f"{mod.emoji} **{mod.label}** — failed")
+                lines.append(f"{mod.emoji} {mod.label} — failed")
                 continue
 
             if snap.get("parse_failed"):
-                lines.append(f"{mod.emoji} **{mod.label}** — parse failed")
+                lines.append(f"{mod.emoji} {mod.label} — parse failed")
                 continue
 
             current = snap.get("display_version") or "unknown"
-            status = "⏳ pending" if snap.get("pending") else "✅ released"
             change = compare_versions(saved.get(mod.id) if isinstance(saved, dict) else None, snap)
 
-            line = f"{mod.emoji} **{snap.get('name') or mod.label}** — `{current}` • {status}"
-            if change != "same":
-                line += f" • `{change}`"
-            lines.append(line)
+            lines.append(f"{mod.emoji} {snap.get('name')} — `{current}` • {change}")
 
-        embed.description = "\n".join(lines) if lines else "no mods tracked."
-        embed.set_footer(text="pending versions are shown but not saved")
+        embed.description = "\n".join(lines)
         return embed
 
 
 bot = GeodeVersionBot()
 
 
-async def safe_defer(interaction: discord.Interaction) -> None:
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.defer()
-    except Exception:
-        log.exception("failed to defer interaction")
+async def safe_defer(interaction):
+    if not interaction.response.is_done():
+        await interaction.response.defer()
 
 
-@bot.tree.command(name="checkforupdates", description="check the tracked geode mods for version changes")
-async def checkforupdates(interaction: discord.Interaction) -> None:
+@bot.tree.command(name="checkforupdates")
+async def checkforupdates(interaction):
     await safe_defer(interaction)
-    snaps, error = await bot.build_report()
-    await interaction.followup.send(embed=bot.make_check_embed(snaps, error))
+    snaps, _ = await bot.build_report()
+    await interaction.followup.send(embed=bot.make_check_embed(snaps))
 
 
 @bot.event
-async def on_ready() -> None:
-    log.info("logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
+async def on_ready():
+    log.info("logged in as %s", bot.user)
 
 
-def main() -> None:
+def main():
     if not token:
-        raise RuntimeError("DISCORD_TOKEN is not set")
+        raise RuntimeError("missing DISCORD_TOKEN")
     bot.run(token)
 
 
