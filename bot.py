@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -15,6 +16,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 API_URL = "https://api.geode-sdk.org/v1/mods/{}"
 STATE_FILE = Path("geode_version_state.json")
 CHECK_INTERVAL_MINUTES = 15
+
 TRACKED_MOD_IDS = (
     "axiom.echochoke",
     "axiom.echoclip",
@@ -26,9 +28,40 @@ logging.basicConfig(
 )
 log = logging.getLogger("geode-version-checker")
 
+CHANGELOG_VERSION_RE = re.compile(
+    r"^\s*v?(\d+(?:\.\d+)+(?:[-+][\w.]+)?)\s*$",
+    re.IGNORECASE,
+)
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def unwrap_payload(data: Any) -> dict[str, Any]:
+    if isinstance(data, dict):
+        payload = data.get("payload")
+        if isinstance(payload, dict):
+            return payload
+        return data
+    return {}
+
+
+def strip_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text)
+
+
+def version_from_changelog(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+
+    cleaned = strip_tags(text)
+    for line in cleaned.splitlines():
+        line = line.strip()
+        m = CHANGELOG_VERSION_RE.match(line)
+        if m:
+            return m.group(1)
+    return None
 
 
 def first_text(data: Any, keys: tuple[str, ...]) -> Optional[str]:
@@ -36,8 +69,6 @@ def first_text(data: Any, keys: tuple[str, ...]) -> Optional[str]:
         return None
     for key in keys:
         value = data.get(key)
-        if value is None:
-            continue
         if isinstance(value, str):
             text = value.strip()
             if text:
@@ -106,10 +137,39 @@ def matches_mod_id(node: dict[str, Any], target_id: str) -> bool:
     return False
 
 
+def find_mod_node(payload: Any, target_id: str) -> Optional[dict[str, Any]]:
+    if isinstance(payload, dict):
+        for key in (target_id, target_id.lower(), target_id.upper()):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                return value
+
+        for wrapper_key in ("mods", "data", "items", "results", "entries"):
+            wrapped = payload.get(wrapper_key)
+            if isinstance(wrapped, dict):
+                for key, value in wrapped.items():
+                    if (
+                        isinstance(key, str)
+                        and key.strip().lower() == target_id.lower()
+                        and isinstance(value, dict)
+                    ):
+                        return value
+            elif isinstance(wrapped, list):
+                for item in wrapped:
+                    if isinstance(item, dict) and matches_mod_id(item, target_id):
+                        return item
+
+    for node in walk_json(payload):
+        if isinstance(node, dict) and matches_mod_id(node, target_id):
+            return node
+
+    return None
+
+
 def _collect_candidates(mod: dict[str, Any]) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
 
-    root_candidate = {}
+    root_candidate: dict[str, Any] = {}
     for key in ("version", "latestVersion", "latest_version", "currentVersion", "current_version"):
         if key in mod and mod.get(key) is not None:
             root_candidate["version"] = mod.get(key)
@@ -160,8 +220,12 @@ def _compact_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
 
 def choose_version_candidate_from_mod(mod: dict[str, Any]) -> Optional[dict[str, Any]]:
     candidates = _collect_candidates(mod)
+
     if not candidates:
-        if isinstance(mod.get("version"), str):
+        changelog_version = version_from_changelog(first_text(mod, ("changelog",)))
+        if changelog_version:
+            candidates.append({"version": changelog_version, "status": "released"})
+        elif isinstance(mod.get("version"), str):
             candidates.append({"version": mod["version"]})
         else:
             return None
@@ -225,8 +289,10 @@ def extract_mod_snapshot(mod_id: str, mod_node: dict[str, Any]) -> dict[str, Any
             "release_date": None,
             "raw": {},
         }
+        parse_failed = True
     else:
         current = chosen
+        parse_failed = False
 
     version = current["version"]
     pending = bool(current["pending"])
@@ -245,7 +311,7 @@ def extract_mod_snapshot(mod_id: str, mod_node: dict[str, Any]) -> dict[str, Any
         "release_date": current["release_date"],
         "raw": mod_node,
         "version_candidates": [_compact_candidate(c) for c in _collect_candidates(mod_node)],
-        "parse_failed": chosen is None,
+        "parse_failed": parse_failed,
     }
 
 
@@ -357,60 +423,77 @@ class GeodeVersionBot(commands.Bot):
                 self.poll_versions.cancel()
         except Exception:
             pass
+
         if self.session and not self.session.closed:
             await self.session.close()
+
         await super().close()
 
-    async def fetch_snapshots(self) -> dict[str, dict[str, Any]]:
+    async def fetch_one_snapshot(self, mod_id: str) -> tuple[str, dict[str, Any]]:
         if not self.session:
-            raise RuntimeError("http session not ready")
+            return mod_id, {
+                "id": mod_id,
+                "name": mod_id,
+                "author": None,
+                "version": None,
+                "display_version": "unknown",
+                "pending": False,
+                "released": False,
+                "status": "error",
+                "release_date": None,
+                "raw": {},
+                "version_candidates": [],
+                "parse_failed": True,
+                "error": "http session not ready",
+            }
 
-        snapshots: dict[str, dict[str, Any]] = {}
+        try:
+            async with self.session.get(API_URL.format(mod_id)) as res:
+                if res.status != 200:
+                    text = await res.text()
+                    return mod_id, {
+                        "id": mod_id,
+                        "name": mod_id,
+                        "author": None,
+                        "version": None,
+                        "display_version": "unknown",
+                        "pending": False,
+                        "released": False,
+                        "status": f"http {res.status}",
+                        "release_date": None,
+                        "raw": text,
+                        "version_candidates": [],
+                        "parse_failed": True,
+                        "error": f"http {res.status}",
+                    }
 
-        for mod_id in TRACKED_MOD_IDS:
-            try:
-                async with self.session.get(API_URL.format(mod_id)) as res:
-                    if res.status != 200:
-                        snapshots[mod_id] = {
-                            "id": mod_id,
-                            "name": mod_id,
-                            "author": None,
-                            "version": None,
-                            "display_version": "unknown",
-                            "pending": False,
-                            "released": False,
-                            "status": f"http {res.status}",
-                            "release_date": None,
-                            "raw": await res.text(),
-                            "version_candidates": [],
-                            "parse_failed": True,
-                            "error": f"http {res.status}",
-                        }
-                        continue
+                data = await res.json(content_type=None)
+                data = unwrap_payload(data)
 
-                    data = await res.json(content_type=None)
-                    snapshot = extract_mod_snapshot(mod_id, data)
-                    snapshot["raw"] = data
-                    snapshots[mod_id] = snapshot
+                snapshot = extract_mod_snapshot(mod_id, data)
+                snapshot["raw"] = data
+                return mod_id, snapshot
 
-            except Exception as e:
-                snapshots[mod_id] = {
-                    "id": mod_id,
-                    "name": mod_id,
-                    "author": None,
-                    "version": None,
-                    "display_version": "unknown",
-                    "pending": False,
-                    "released": False,
-                    "status": "error",
-                    "release_date": None,
-                    "raw": {},
-                    "version_candidates": [],
-                    "parse_failed": True,
-                    "error": str(e),
-                }
+        except Exception as e:
+            return mod_id, {
+                "id": mod_id,
+                "name": mod_id,
+                "author": None,
+                "version": None,
+                "display_version": "unknown",
+                "pending": False,
+                "released": False,
+                "status": "error",
+                "release_date": None,
+                "raw": {},
+                "version_candidates": [],
+                "parse_failed": True,
+                "error": str(e),
+            }
 
-        return snapshots
+    async def fetch_snapshots(self) -> dict[str, dict[str, Any]]:
+        results = await asyncio.gather(*(self.fetch_one_snapshot(mod_id) for mod_id in TRACKED_MOD_IDS))
+        return dict(results)
 
     def apply_snapshot_to_state(self, snapshots: dict[str, dict[str, Any]]) -> list[str]:
         changed: list[str] = []
