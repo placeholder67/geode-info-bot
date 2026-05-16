@@ -96,15 +96,7 @@ def is_pending(d: dict) -> bool:
 # =========================
 
 def find_version(d: dict) -> Optional[str]:
-    if not isinstance(d, dict):
-        return None
-
-    for k in ("version", "latestVersion", "currentVersion"):
-        v = d.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-
-    return None
+    return d.get("versions")[0].get("version")
 
 
 # =========================
