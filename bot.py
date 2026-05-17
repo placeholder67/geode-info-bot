@@ -185,11 +185,30 @@ bot = Bot()
 # cmds
 
 @bot.tree.command(name="checkforupdates", description="live geode mod status")
-async def checkforupdates(interaction: discord.Interaction):
+@discord.app_commands.describe(mod="choose one mod to check")
+async def checkforupdates(interaction: discord.Interaction, mod: Optional[str] = None):
     await interaction.response.defer()
 
-    data = await bot.fetch_all()
+    if mod is None:
+        data = await bot.fetch_all()
+    else:
+        selected_mod = next((m for m in MODS if m.id == mod), None)
+        if selected_mod is None:
+            data = await bot.fetch_all()
+        else:
+            data = [await bot.fetch_mod(selected_mod)]
+
     await interaction.followup.send(embed=bot.build_embed(data))
+
+
+@checkforupdates.autocomplete("mod")
+async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, current: str):
+    current = current.lower()
+    return [
+        discord.app_commands.Choice(name=f"{m.emoji} {m.name}", value=m.id)
+        for m in MODS
+        if current in m.id.lower() or current in m.name.lower()
+    ][:25]
 
 
 def main():
