@@ -2,8 +2,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import dat:contentReference[oaicite:1]{index=1}tional
 
 import aiohttp
 import discord
@@ -52,6 +51,49 @@ def find_version(d: dict) -> Optional[str]:
     return d.get("versions")[0].get("version")
 
 
+def find_downloads(d: dict) -> Optional[int]:
+    if not isinstance(d, dict):
+        return None
+
+    candidates = [
+        d.get("downloads"),
+        d.get("download_count"),
+        d.get("downloads_total"),
+    ]
+
+    stats = d.get("stats")
+    if isinstance(stats, dict):
+        candidates.extend([
+            stats.get("downloads"),
+            stats.get("download_count"),
+            stats.get("downloads_total"),
+        ])
+
+    for value in candidates:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+
+    return None
+
+
+def find_mod_url(d: dict, mod: Mod) -> str:
+    if isinstance(d, dict):
+        for key in ("url", "page", "website", "mod_url"):
+            value = d.get(key)
+            if isinstance(value, str) and value:
+                return value
+
+        links = d.get("links")
+        if isinstance(links, dict):
+            for key in ("website", "page", "url"):
+                value = links.get(key)
+                if isinstance(value, str) and value:
+                    return value
+
+    return f"https://geode-sdk.org/mods/{mod.id}"
+
 
 class Bot(commands.Bot):
     def __init__(self):
@@ -76,11 +118,15 @@ class Bot(commands.Bot):
 
                 version = find_version(data)
                 pending = is_pending(data)
+                downloads = find_downloads(data)
+                url = find_mod_url(data, mod)
 
                 return {
                     "mod": mod,
                     "version": version or "unknown",
                     "pending": pending,
+                    "downloads": downloads,
+                    "url": url,
                 }
 
         except Exception as e:
@@ -88,6 +134,8 @@ class Bot(commands.Bot):
                 "mod": mod,
                 "version": "error",
                 "pending": False,
+                "downloads": None,
+                "url": f"https://geode-sdk.org/mods/{mod.id}",
                 "error": str(e),
             }
 
@@ -114,8 +162,15 @@ class Bot(commands.Bot):
             else:
                 status = "✅ On the index"
 
+            downloads = (
+                f"{r['downloads']:,}"
+                if isinstance(r.get("downloads"), int)
+                else "unknown"
+            )
+
             lines.append(
-                f"{m.emoji} **{m.name}** — `{r['version']}` • {status}"
+                f"{m.emoji} [{m.name}]({r['url']}) — `{r['version']}` • "
+                f"{downloads} downloads • {status}"
             )
 
         e.description = "\n".join(lines)
