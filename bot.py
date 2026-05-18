@@ -24,13 +24,18 @@ class Mod:
     emoji: str
 
 
-MODS = (
+MODS = [
     Mod("axiom.echochoke", "EchoChoke", "🟣"),
     Mod("axiom.echoclip", "EchoClip", "🔵"),
     Mod("axiom.voicecontrol", "Voice Control", "⚫"),
     Mod("axiom.cube-abuse", "Cube Abuse", "🟡"),
     Mod("axiom.100-days", "100 Days", "🔴"),
-)
+]
+
+ALLOWED_USER_IDS = {
+    1470498076325314571,
+    1411637140101660692,
+}
 
 
 def unwrap(data: Any) -> dict:
@@ -148,6 +153,16 @@ class Bot(commands.Bot):
             async with self.session.get(api_url.format(mod.id)) as r:
                 raw_text = await r.text()
 
+                if r.status == 404:
+                    return {
+                        "mod": mod,
+                        "version": "not_found",
+                        "pending": False,
+                        "downloads": None,
+                        "url": f"https://geode-sdk.org/mods/{mod.id}",
+                        "error": "❌Not on the index",
+                    }
+
                 if r.status != 200:
                     return {
                         "mod": mod,
@@ -234,6 +249,8 @@ class Bot(commands.Bot):
             if r["version"] == "error":
                 error_reason = r.get("error", "unknown error")
                 status = f"❌ error: {error_reason}"
+            elif r["version"] == "not_found":
+                status = "❌Not on the index"
             elif r["pending"]:
                 status = "⏳ Pending"
             else:
@@ -262,16 +279,23 @@ bot = Bot()
 @bot.tree.command(name="checkforupdates", description="live geode mod status")
 @discord.app_commands.describe(mod="choose one mod to check")
 async def checkforupdates(interaction: discord.Interaction, mod: Optional[str] = None):
+    if mod is not None:
+        selected_mod = next((m for m in MODS if m.id == mod), None)
+        if selected_mod is None:
+            await interaction.response.send_message("❌Not on the index")
+            return
+
     await interaction.response.defer()
 
     if mod is None:
         data = await bot.fetch_all()
     else:
         selected_mod = next((m for m in MODS if m.id == mod), None)
-        if selected_mod is None:
-            data = await bot.fetch_all()
-        else:
-            data = [await bot.fetch_mod(selected_mod)]
+        data = [await bot.fetch_mod(selected_mod)]
+
+        if data[0].get("version") == "not_found":
+            await interaction.followup.send("❌Not on the index")
+            return
 
     await interaction.followup.send(embed=bot.build_embed(data))
 
@@ -284,6 +308,63 @@ async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, cur
         for m in MODS
         if current in m.id.lower() or current in m.name.lower()
     ][:25]
+
+
+@bot.tree.command(name="addnewmodid", description="add a new mod id to the index")
+@discord.app_commands.describe(mod_id="new mod id", name="display name", emoji="emoji")
+async def addnewmodid(
+    interaction: discord.Interaction,
+    mod_id: str,
+    name: Optional[str] = None,
+    emoji: str = "⚪",
+):
+    if interaction.user.id not in ALLOWED_USER_IDS:
+        await interaction.response.send_message("❌ Access Denied")
+        return
+
+    clean_mod_id = mod_id.strip()
+    clean_name = name.strip() if isinstance(name, str) and name.strip() else clean_mod_id
+    clean_emoji = emoji.strip() if isinstance(emoji, str) and emoji.strip() else "⚪"
+
+    existing = next((m for m in MODS if m.id == clean_mod_id), None)
+    if existing is None:
+        MODS.append(Mod(clean_mod_id, clean_name, clean_emoji))
+    else:
+        index = MODS.index(existing)
+        MODS[index] = Mod(clean_mod_id, clean_name, clean_emoji)
+
+    await interaction.response.send_message(f"added {clean_mod_id}")
+
+
+@bot.tree.command(name="editmodid", description="edit an existing mod id in the index")
+@discord.app_commands.describe(old_mod_id="current mod id", new_mod_id="new mod id")
+async def editmodid(
+    interaction: discord.Interaction,
+    old_mod_id: str,
+    new_mod_id: str,
+):
+    if interaction.user.id not in ALLOWED_USER_IDS:
+        await interaction.response.send_message("❌ Access Denied")
+        return
+
+    clean_old_mod_id = old_mod_id.strip()
+    clean_new_mod_id = new_mod_id.strip()
+
+    target_index = next(
+        (i for i, m in enumerate(MODS) if m.id == clean_old_mod_id),
+        None,
+    )
+
+    if target_index is None:
+        await interaction.response.send_message("❌Not on the index")
+        return
+
+    current_mod = MODS[target_index]
+    MODS[target_index] = Mod(clean_new_mod_id, current_mod.name, current_mod.emoji)
+
+    await interaction.response.send_message(
+        f"edited {clean_old_mod_id} to {clean_new_mod_id}"
+    )
 
 
 def main():
