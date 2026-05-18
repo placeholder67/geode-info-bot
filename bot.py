@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -25,9 +26,10 @@ class Mod:
 
 MODS = (
     Mod("axiom.echochoke", "EchoChoke", "🟣"),
-    Mod("axiom.echoclip", "EchoClip", "🔴"),
-    Mod("axiom.voicecontrol", "Voice Control", "🔵"),
+    Mod("axiom.echoclip", "EchoClip", "🔵"),
+    Mod("axiom.voicecontrol", "Voice Control", "⚫"),
     Mod("axiom.cube-abuse", "Cube Abuse", "🟡"),
+    Mod("axiom.100-days", "Cube Abuse", "🔴"),
 )
 
 
@@ -41,7 +43,15 @@ def is_pending(d: dict) -> bool:
     if not isinstance(d, dict):
         return False
 
-    status = d.get("versions")[0].get("status")
+    versions = d.get("versions")
+    if not isinstance(versions, list) or not versions:
+        return False
+
+    first_version = versions[0]
+    if not isinstance(first_version, dict):
+        return False
+
+    status = first_version.get("status")
     if status == "accepted":
         return False
     else:
@@ -50,7 +60,19 @@ def is_pending(d: dict) -> bool:
 
 # find latest ver
 def find_version(d: dict) -> Optional[str]:
-    return d.get("versions")[0].get("version")
+    if not isinstance(d, dict):
+        return None
+
+    versions = d.get("versions")
+    if not isinstance(versions, list) or not versions:
+        return None
+
+    first_version = versions[0]
+    if not isinstance(first_version, dict):
+        return None
+
+    version = first_version.get("version")
+    return version if isinstance(version, str) else None
 
 
 def find_downloads(d: dict) -> Optional[int]:
@@ -97,6 +119,14 @@ def find_mod_url(d: dict, mod: Mod) -> str:
     return f"https://geode-sdk.org/mods/{mod.id}"
 
 
+def format_error_reason(error: Any) -> str:
+    text = str(error).strip() if error is not None else "unknown error"
+    text = " ".join(text.split())
+    if not text:
+        text = "unknown error"
+    return text[:180]
+
+
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=discord.Intents.default())
@@ -116,7 +146,33 @@ class Bot(commands.Bot):
     async def fetch_mod(self, mod: Mod):
         try:
             async with self.session.get(api_url.format(mod.id)) as r:
-                data = unwrap(await r.json(content_type=None))
+                raw_text = await r.text()
+
+                if r.status != 200:
+                    return {
+                        "mod": mod,
+                        "version": "error",
+                        "pending": False,
+                        "downloads": None,
+                        "url": f"https://geode-sdk.org/mods/{mod.id}",
+                        "error": f"HTTP {r.status} {r.reason}" + (
+                            f" — {raw_text.strip()[:120]}" if raw_text.strip() else ""
+                        ),
+                    }
+
+                try:
+                    raw_data = json.loads(raw_text)
+                except json.JSONDecodeError as e:
+                    return {
+                        "mod": mod,
+                        "version": "error",
+                        "pending": False,
+                        "downloads": None,
+                        "url": f"https://geode-sdk.org/mods/{mod.id}",
+                        "error": f"invalid json response: {format_error_reason(e)}",
+                    }
+
+                data = unwrap(raw_data)
 
                 version = find_version(data)
                 pending = is_pending(data)
@@ -131,6 +187,24 @@ class Bot(commands.Bot):
                     "url": url,
                 }
 
+        except asyncio.TimeoutError as e:
+            return {
+                "mod": mod,
+                "version": "error",
+                "pending": False,
+                "downloads": None,
+                "url": f"https://geode-sdk.org/mods/{mod.id}",
+                "error": f"timeout: {format_error_reason(e)}",
+            }
+        except aiohttp.ClientError as e:
+            return {
+                "mod": mod,
+                "version": "error",
+                "pending": False,
+                "downloads": None,
+                "url": f"https://geode-sdk.org/mods/{mod.id}",
+                "error": f"network error: {format_error_reason(e)}",
+            }
         except Exception as e:
             return {
                 "mod": mod,
@@ -138,7 +212,7 @@ class Bot(commands.Bot):
                 "pending": False,
                 "downloads": None,
                 "url": f"https://geode-sdk.org/mods/{mod.id}",
-                "error": str(e),
+                "error": format_error_reason(e),
             }
 
     async def fetch_all(self):
@@ -157,10 +231,11 @@ class Bot(commands.Bot):
         for r in results:
             m = r["mod"]
 
-            if r["pending"]:
+            if r["version"] == "error":
+                error_reason = r.get("error", "unknown error")
+                status = f"❌ error: {error_reason}"
+            elif r["pending"]:
                 status = "⏳ Pending"
-            elif r["version"] == "error":
-                status = "❌ error"
             else:
                 status = "✅ On the index"
 
