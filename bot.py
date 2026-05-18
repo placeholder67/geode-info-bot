@@ -29,7 +29,7 @@ MODS = (
     Mod("axiom.echoclip", "EchoClip", "🔵"),
     Mod("axiom.voicecontrol", "Voice Control", "⚫"),
     Mod("axiom.cube-abuse", "Cube Abuse", "🟡"),
-    Mod("axiom.100-days", "Cube Abuse", "🔴"),
+    Mod("axiom.100-days", "100 Days", "🔴"),
 )
 
 
