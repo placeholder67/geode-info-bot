@@ -293,10 +293,6 @@ async def checkforupdates(interaction: discord.Interaction, mod: Optional[str] =
         selected_mod = next((m for m in MODS if m.id == mod), None)
         data = [await bot.fetch_mod(selected_mod)]
 
-        if data[0].get("version") == "not_found":
-            await interaction.followup.send("❌Not on the index")
-            return
-
     await interaction.followup.send(embed=bot.build_embed(data))
 
 
@@ -336,19 +332,19 @@ async def addnewmodid(
     await interaction.response.send_message(f"added {clean_mod_id}")
 
 
-@bot.tree.command(name="editmodid", description="edit an existing mod id in the index")
+@bot.tree.command(name="editmodid", description="edit or remove an existing mod id in the index")
 @discord.app_commands.describe(old_mod_id="current mod id", new_mod_id="new mod id")
 async def editmodid(
     interaction: discord.Interaction,
     old_mod_id: str,
-    new_mod_id: str,
+    new_mod_id: Optional[str] = None,
 ):
     if interaction.user.id not in ALLOWED_USER_IDS:
         await interaction.response.send_message("❌ Access Denied")
         return
 
     clean_old_mod_id = old_mod_id.strip()
-    clean_new_mod_id = new_mod_id.strip()
+    clean_new_mod_id = new_mod_id.strip() if isinstance(new_mod_id, str) else ""
 
     target_index = next(
         (i for i, m in enumerate(MODS) if m.id == clean_old_mod_id),
@@ -360,6 +356,12 @@ async def editmodid(
         return
 
     current_mod = MODS[target_index]
+
+    if not clean_new_mod_id:
+        MODS.pop(target_index)
+        await interaction.response.send_message(f"removed {clean_old_mod_id}")
+        return
+
     MODS[target_index] = Mod(clean_new_mod_id, current_mod.name, current_mod.emoji)
 
     await interaction.response.send_message(
