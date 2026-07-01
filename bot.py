@@ -17,9 +17,7 @@ api_url = "https://api.geode-sdk.org/v1/mods/{}"
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("geode")
 
-# ==========================================
-# BANNED WORDS FILTER
-# ==========================================
+# banned words filter
 BANNED_WORDS = [
     "nigger",
     "nigga",
@@ -32,31 +30,24 @@ BANNED_WORDS = [
 ]
 
 def contains_banned_word(text: str) -> bool:
-    """Checks if the text contains any explicitly banned words using word boundaries."""
     if not text:
         return False
     text_lower = text.lower()
     for banned in BANNED_WORDS:
-        # \b ensures we only match whole words (e.g., 'fag' won't block 'defag')
         if re.search(rf"\b{re.escape(banned)}\b", text_lower):
             return True
     return False
 
-
 def normalize_single_mod_response(data: Any) -> dict:
-    """Safely extracts a single mod object regardless of how the API wraps it."""
     if isinstance(data, dict):
         payload = data.get("payload", data)
         if isinstance(payload, dict):
-            # Sometimes the payload itself contains a 'data' object
             if "data" in payload and isinstance(payload["data"], dict):
                 return payload["data"]
             return payload
     return {}
 
-
 def normalize_list_response(data: Any) -> dict:
-    """Safely extracts a list of mods and count from the API response."""
     if isinstance(data, list):
         return {"count": len(data), "data": data}
     if isinstance(data, dict):
@@ -67,7 +58,6 @@ def normalize_list_response(data: Any) -> dict:
             if "data" in payload and isinstance(payload["data"], list):
                 return payload
     return {"count": 0, "data": []}
-
 
 def is_pending(d: dict) -> bool:
     if not isinstance(d, dict):
@@ -84,18 +74,15 @@ def is_pending(d: dict) -> bool:
         return status not in ("accepted", "approved")
     return False
 
-
 def find_version(d: dict) -> Optional[str]:
     if not isinstance(d, dict):
         return None
         
-    # Check top-level properties first (API V1 standard)
     if "version" in d and isinstance(d["version"], str):
         return d["version"]
     if "latest_version" in d and isinstance(d["latest_version"], str):
         return d["latest_version"]
         
-    # Fallback to versions array
     versions = d.get("versions")
     if isinstance(versions, list) and len(versions) > 0:
         first_version = versions[0]
@@ -104,10 +91,9 @@ def find_version(d: dict) -> Optional[str]:
             
     return None
 
-
 def find_developer(mod_data: dict) -> str:
     if not isinstance(mod_data, dict):
-        return "Unknown Developer"
+        return "unknown"
         
     dev = mod_data.get("developer")
     if dev and isinstance(dev, str):
@@ -119,14 +105,13 @@ def find_developer(mod_data: dict) -> str:
         if isinstance(first, str):
             return first
         if isinstance(first, dict):
-            return first.get("display_name") or first.get("username") or "Unknown Developer"
+            return first.get("display_name") or first.get("username") or "unknown"
             
     owner = mod_data.get("owner")
     if owner and isinstance(owner, str):
         return owner
         
-    return "Unknown Developer"
-
+    return "unknown"
 
 def find_downloads(d: dict) -> Optional[int]:
     if not isinstance(d, dict):
@@ -150,7 +135,6 @@ def find_downloads(d: dict) -> Optional[int]:
             return int(value)
     return None
 
-
 def find_mod_url(d: dict, mod_id: str) -> str:
     if isinstance(d, dict):
         for key in ("url", "page", "website", "mod_url"):
@@ -165,26 +149,41 @@ def find_mod_url(d: dict, mod_id: str) -> str:
                     return value
     return f"https://geode-sdk.org/mods/{mod_id}"
 
+def find_description(d: dict) -> str:
+    """Robustly dig for the description since the API moves it around."""
+    if not isinstance(d, dict):
+        return "no description"
+        
+    candidates = [d.get("description"), d.get("summary")]
+    
+    versions = d.get("versions")
+    if isinstance(versions, list) and versions:
+        v = versions[0]
+        if isinstance(v, dict):
+            candidates.extend([v.get("description"), v.get("summary")])
+            
+    for c in candidates:
+        if isinstance(c, str) and c.strip():
+            return c.strip()
+            
+    return "no description"
 
 def format_error_reason(error: Any) -> str:
     text = str(error).strip() if error is not None else "unknown error"
     text = " ".join(text.split())
-    if not text:
-        text = "unknown error"
-    return text[:180]
-
+    return text[:180] or "unknown error"
 
 def build_single_mod_embed(mod_data: dict) -> discord.Embed:
     mod_id = mod_data.get("id") or "unknown.id"
     name = mod_data.get("name") or mod_id
     dev = find_developer(mod_data)
-    desc = mod_data.get("description") or "No description provided."
-    version = find_version(mod_data) or "Unknown"
+    desc = find_description(mod_data)
+    version = find_version(mod_data) or "unknown"
     downloads = find_downloads(mod_data)
     pending = is_pending(mod_data)
     url = find_mod_url(mod_data, mod_id)
 
-    color = discord.Color.gold() if pending else discord.Color.brand_green()
+    color = 0xffd700 if pending else 0x2ecc71
 
     embed = discord.Embed(
         title=f"{name} ({version})",
@@ -194,25 +193,24 @@ def build_single_mod_embed(mod_data: dict) -> discord.Embed:
         timestamp=datetime.now(timezone.utc)
     )
     
-    embed.set_author(name=f"Created by {dev}")
+    embed.set_author(name=f"by {dev}")
     
-    dl_text = f"{downloads:,}" if downloads is not None else "Unknown"
-    status_text = "⏳ Pending" if pending else "✅ On the index"
+    dl_text = f"{downloads:,}" if downloads is not None else "n/a"
+    status_text = "pending" if pending else "verified"
 
-    embed.add_field(name="Mod ID", value=f"`{mod_id}`", inline=True)
-    embed.add_field(name="Downloads", value=dl_text, inline=True)
-    embed.add_field(name="Status", value=status_text, inline=True)
+    embed.add_field(name="id", value=f"`{mod_id}`", inline=True)
+    embed.add_field(name="downloads", value=dl_text, inline=True)
+    embed.add_field(name="status", value=status_text, inline=True)
 
     tags = mod_data.get("tags", [])
     if tags:
-        embed.add_field(name="Tags", value=", ".join(tags), inline=False)
+        embed.add_field(name="tags", value=", ".join(tags), inline=False)
         
-    embed.set_footer(text="Geode Index")
+    embed.set_footer(text="geode index")
     return embed
 
-
 def build_list_embed(title: str, mods: list, page: int, total_pages: int) -> discord.Embed:
-    embed = discord.Embed(title=title, color=discord.Color.blurple())
+    embed = discord.Embed(title=title, color=0x5865F2)
     lines = []
     
     for i, m in enumerate(mods, 1):
@@ -220,21 +218,21 @@ def build_list_embed(title: str, mods: list, page: int, total_pages: int) -> dis
         name = m.get("name") or mod_id
         dev = find_developer(m)
         dl = find_downloads(m) or 0
-        desc = m.get("description", "No description.")
+        desc = find_description(m)
         
-        if len(desc) > 30:
-            desc = desc[:27] + "..."
+        # increased from 30 so you can actually read it
+        if len(desc) > 85:
+            desc = desc[:82] + "..."
             
-        lines.append(f"**{i}. [{name}](https://geode-sdk.org/mods/{mod_id})** by {dev}\n> {desc}\n> 📦 `{mod_id}` • ⬇️ {dl:,} downloads")
+        lines.append(f"**{i}. [{name}](https://geode-sdk.org/mods/{mod_id})** by {dev}\n> {desc}\n> 📦 `{mod_id}` • ⬇️ {dl:,}")
 
     if not lines:
-        embed.description = "*No mods found. Try a different search!*"
+        embed.description = "*no mods found.*"
     else:
         embed.description = "\n\n".join(lines)
 
-    embed.set_footer(text=f"Page {page} of {max(1, total_pages)} • Use the dropdown below to view details")
+    embed.set_footer(text=f"page {page}/{max(1, total_pages)}")
     return embed
-
 
 class ModSelect(discord.ui.Select):
     def __init__(self, mods: list):
@@ -242,15 +240,16 @@ class ModSelect(discord.ui.Select):
         for m in mods:
             mod_id = (m.get("id") or "unknown.id")[:90]
             name = (m.get("name") or mod_id)[:90]
-            desc = m.get("description", "No description.")
+            desc = find_description(m)
             
-            if len(desc) > 30:
-                desc = desc[:27] + "..."
+            # discord limits select descriptions to 100 chars
+            if len(desc) > 95:
+                desc = desc[:92] + "..."
                 
             options.append(discord.SelectOption(label=name, description=desc, value=mod_id))
             
         super().__init__(
-            placeholder="Select a mod from this page to see its info...",
+            placeholder="select a mod...",
             min_values=1,
             max_values=1,
             options=options
@@ -258,17 +257,15 @@ class ModSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         mod_id = self.values[0]
-        # Defer response to handle API fetch latency safely
         await interaction.response.defer(ephemeral=True)
         mod_data = await interaction.client.fetch_single_mod(mod_id)
         
         if "error" in mod_data:
-            await interaction.followup.send(f"❌ Oops, ran into an issue fetching that mod: {mod_data['error']}", ephemeral=True)
+            await interaction.followup.send(f"error fetching mod: {mod_data['error']}", ephemeral=True)
             return
             
         embed = build_single_mod_embed(mod_data)
         await interaction.followup.send(embed=embed, ephemeral=True)
-
 
 class ModSearchView(discord.ui.View):
     def __init__(self, bot, query: str = None, is_trending: bool = False):
@@ -302,21 +299,20 @@ class ModSearchView(discord.ui.View):
     async def generate_view(self):
         await self.load_data()
         self.update_items()
-        title = "🔥 Trending Geode Mods" if self.is_trending else f"🔍 Search Results: {self.query}"
+        title = "trending mods" if self.is_trending else f"search: {self.query}"
         return build_list_embed(title, self.mods, self.page, self.total_pages)
 
-    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, custom_id="prev")
+    @discord.ui.button(label="<", style=discord.ButtonStyle.secondary, custom_id="prev")
     async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page -= 1
         embed = await self.generate_view()
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary, custom_id="next")
+    @discord.ui.button(label=">", style=discord.ButtonStyle.secondary, custom_id="next")
     async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page += 1
         embed = await self.generate_view()
         await interaction.response.edit_message(embed=embed, view=self)
-
 
 class Bot(commands.Bot):
     def __init__(self):
@@ -340,7 +336,7 @@ class Bot(commands.Bot):
         try:
             async with self.session.get(api_url.format(mod_id)) as r:
                 if r.status == 404:
-                    return {"error": "Mod not found."}
+                    return {"error": "mod not found"}
                 r.raise_for_status()
                 data = await r.json()
                 return normalize_single_mod_response(data)
@@ -364,20 +360,14 @@ class Bot(commands.Bot):
         except Exception:
             return {"count": 0, "data": []}
 
-
 bot = Bot()
 
-# ==========================================
-# GEODE COMMANDS
-# ==========================================
+# geode commands
 
-@bot.tree.command(
-    name="checkforupdates",
-    description="Browse trending Geode mods, search the index, or view a specific mod's status",
-)
+@bot.tree.command(name="checkforupdates", description="browse trending geode mods or search the index")
 @discord.app_commands.describe(
-    mod_id="Select a specific mod to view (autocompletes from the API)",
-    search="Search for a mod by its name"
+    mod_id="specific mod to view (autocompletes from api)",
+    search="search mod by name"
 )
 async def checkforupdates(
     interaction: discord.Interaction,
@@ -385,14 +375,14 @@ async def checkforupdates(
     search: Optional[str] = None,
 ):
     if (search and contains_banned_word(search)) or (mod_id and contains_banned_word(mod_id)):
-        return await interaction.response.send_message("❌ Search blocked: Contains inappropriate language.", ephemeral=True)
+        return await interaction.response.send_message("blocked: contains banned words.", ephemeral=True)
 
     await interaction.response.defer()
 
     if mod_id:
         mod_data = await bot.fetch_single_mod(mod_id)
         if "error" in mod_data:
-            return await interaction.followup.send(f"❌ {mod_data['error']}")
+            return await interaction.followup.send(f"error: {mod_data['error']}")
         
         embed = build_single_mod_embed(mod_data)
         await interaction.followup.send(embed=embed)
@@ -406,7 +396,6 @@ async def checkforupdates(
         view = ModSearchView(bot, query=None, is_trending=True)
         embed = await view.generate_view()
         await interaction.followup.send(embed=embed, view=view)
-
 
 @checkforupdates.autocomplete("mod_id")
 async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, current: str):
@@ -424,17 +413,11 @@ async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, cur
         
     return choices[:25]
 
-
-@bot.tree.command(
-    name="erymanthus", 
-    description="Have a mod idea? Check if someone has already made it on the Geode index!"
-)
-@discord.app_commands.describe(
-    search="Describe your mod idea to see if it exists"
-)
+@bot.tree.command(name="erymanthus", description="check if someone has already made your mod idea")
+@discord.app_commands.describe(search="describe your mod idea")
 async def erymanthus(interaction: discord.Interaction, search: str):
     if contains_banned_word(search):
-        return await interaction.response.send_message("❌ Search blocked: Contains inappropriate language.", ephemeral=True)
+        return await interaction.response.send_message("blocked: contains banned words.", ephemeral=True)
 
     await interaction.response.defer()
 
@@ -443,44 +426,36 @@ async def erymanthus(interaction: discord.Interaction, search: str):
 
     if not mods:
         embed = discord.Embed(
-            title="💡 Idea Check: Clear!",
-            description=(
-                f"Great news! We couldn't find any existing mods matching: **{search}**.\n\n"
-                "*Note: This just checks existing mod names and descriptions. Someone might have made your idea but named it differently, so it never hurts to ask around!*"
-            ),
-            color=discord.Color.brand_green()
+            title="idea check: clear",
+            description=f"no existing mods found matching **{search}**.\n\n*note: this only checks titles and descriptions.*",
+            color=0x2ecc71
         )
     else:
         embed = discord.Embed(
-            title="🤔 Idea Check: Similar Mods Found",
-            description=f"We found some existing mods that might match your idea for **{search}**:\n\n",
-            color=discord.Color.orange()
+            title="idea check: similar mods found",
+            description=f"found these existing mods for **{search}**:\n\n",
+            color=0xe67e22
         )
 
         for m in mods:
             mod_id = m.get("id") or "unknown.id"
             name = m.get("name") or mod_id
-            desc = m.get("description", "No description.")
+            desc = find_description(m)
             
-            if len(desc) > 30:
-                desc = desc[:27] + "..."
+            if len(desc) > 85:
+                desc = desc[:82] + "..."
                 
             embed.description += f"**[{name}](https://geode-sdk.org/mods/{mod_id})** (`{mod_id}`)\n> {desc}\n\n"
 
-        embed.description += "\n*Note: This just searches current mod descriptions and titles. If none of these match what you're thinking, go for it!*"
+        embed.description += "*note: this only checks titles and descriptions.*"
 
     await interaction.followup.send(embed=embed)
 
-
-# ==========================================
-# GEODE DEVELOPER TOOLS (/dev command)
-# ==========================================
-
-@bot.tree.command(name="dev", description="Developer utilities for the Geode SDK")
+@bot.tree.command(name="dev", description="developer utilities for geode")
 @discord.app_commands.describe(
-    command="The developer utility command to run",
-    topic="Fetch a specific topic/search term (only for 'docs')",
-    mod_id="The ID of the mod (only for 'repo', e.g., geode.loader)"
+    command="utility command to run",
+    topic="fetch a specific topic (only for 'docs')",
+    mod_id="mod id (only for 'repo', e.g., geode.loader)"
 )
 @discord.app_commands.choices(command=[
     discord.app_commands.Choice(name="docs", value="docs"),
@@ -498,62 +473,54 @@ async def dev(
 ):
     cmd = command.value
 
-    # Check for banned words in optional inputs
     if (topic and contains_banned_word(topic)) or (mod_id and contains_banned_word(mod_id)):
-        return await interaction.response.send_message("❌ Command blocked: Contains inappropriate language.", ephemeral=True)
+        return await interaction.response.send_message("blocked: contains banned words.", ephemeral=True)
 
-    # --- DOCS ---
     if cmd == "docs":
         base_url = "https://docs.geode-sdk.org/"
         if topic:
             query = urllib.parse.quote(topic)
-            await interaction.response.send_message(f"📚 Search the Geode Docs for **{topic}**: {base_url}?q={query}")
+            await interaction.response.send_message(f"docs search for **{topic}**: {base_url}?q={query}")
         else:
-            await interaction.response.send_message(f"📚 Official Geode SDK Documentation: {base_url}")
+            await interaction.response.send_message(f"geode docs: {base_url}")
 
-    # --- CLI ---
     elif cmd == "cli":
-        embed = discord.Embed(title="Geode CLI Quick-Start", color=discord.Color.green())
-        embed.add_field(name="`geode new`", value="Create a new Geode project with the setup wizard.", inline=False)
-        embed.add_field(name="`geode build`", value="Configure and build the current project.", inline=False)
-        embed.add_field(name="`geode package`", value="Package the compiled mod into a `.geode` file.", inline=False)
-        embed.add_field(name="`geode run`", value="Run Geometry Dash with Geode.", inline=False)
-        embed.add_field(name="`geode profile`", value="Manage your Geometry Dash profiles.", inline=False)
+        embed = discord.Embed(title="cli quick-start", color=0x2ecc71)
+        embed.add_field(name="`geode new`", value="create a new geode project.", inline=False)
+        embed.add_field(name="`geode build`", value="configure and build the project.", inline=False)
+        embed.add_field(name="`geode package`", value="package into a `.geode` file.", inline=False)
+        embed.add_field(name="`geode run`", value="run geometry dash with geode.", inline=False)
+        embed.add_field(name="`geode profile`", value="manage profiles.", inline=False)
         await interaction.response.send_message(embed=embed)
 
-    # --- STATUS ---
     elif cmd == "status":
         await interaction.response.defer()
         
-        api_status = "Unknown"
-        loader_ver = "Unknown"
+        api_status = "unknown"
+        loader_ver = "unknown"
 
         try:
             async with bot.session.get("https://api.geode-sdk.org/") as r:
-                if r.status in (200, 404):
-                    api_status = "✅ Online"
-                else:
-                    api_status = f"⚠️ HTTP {r.status}"
+                api_status = "online" if r.status in (200, 404) else f"http {r.status}"
         except Exception:
-            api_status = "❌ Offline / Unreachable"
+            api_status = "offline"
 
         try:
             async with bot.session.get(api_url.format("geode.loader")) as r:
                 if r.status == 200:
                     data = await r.json()
                     mod_obj = normalize_single_mod_response(data)
-                    loader_ver = find_version(mod_obj) or "Unknown"
+                    loader_ver = find_version(mod_obj) or "unknown"
         except Exception:
             pass
 
-        embed = discord.Embed(title="Geode Index & Server Status", color=discord.Color.blurple())
-        embed.add_field(name="Geode Index API", value=api_status, inline=True)
-        embed.add_field(name="Latest Loader Ver", value=loader_ver, inline=True)
-        embed.add_field(name="API Documentation", value="[Swagger UI](https://api.geode-sdk.org/swagger/)", inline=False)
+        embed = discord.Embed(title="geode api status", color=0x5865F2)
+        embed.add_field(name="api", value=api_status, inline=True)
+        embed.add_field(name="loader ver", value=loader_ver, inline=True)
+        embed.add_field(name="docs", value="[swagger](https://api.geode-sdk.org/swagger/)", inline=False)
         
         await interaction.followup.send(embed=embed)
 
-    # --- TEMPLATE ---
     elif cmd == "template":
         code = (
             "```cpp\n"
@@ -563,19 +530,17 @@ async def dev(
             "class $modify(MyMenuLayer, MenuLayer) {\n"
             "    bool init() {\n"
             "        if (!MenuLayer::init()) return false;\n\n"
-            "        FLAlertLayer::create(\"Geode\", \"Hello World from Geode!\", \"OK\")->show();\n\n"
+            "        FLAlertLayer::create(\"Geode\", \"Hello World!\", \"OK\")->show();\n\n"
             "        return true;\n"
             "    }\n"
             "};\n"
             "```"
         )
-        await interaction.response.send_message(f"Here is a standard Geode `Hello World` boilerplate:\n{code}")
+        await interaction.response.send_message(f"basic geode boilerplate:\n{code}")
 
-    # --- REPO ---
     elif cmd == "repo":
         if not mod_id:
-            await interaction.response.send_message("❌ Please provide a `mod_id` to use the repo command.", ephemeral=True)
-            return
+            return await interaction.response.send_message("error: provide a `mod_id` to use repo command.", ephemeral=True)
 
         await interaction.response.defer()
         
@@ -585,7 +550,6 @@ async def dev(
                     data = await r.json()
                     mod_obj = normalize_single_mod_response(data)
                     
-                    # Search multiple common JSON paths for the repository URL
                     source_url = None
                     links = mod_obj.get("links")
                     if isinstance(links, dict):
@@ -594,42 +558,41 @@ async def dev(
                         source_url = mod_obj.get("repository") or mod_obj.get("source")
                         
                     if source_url:
-                        await interaction.followup.send(f"🔗 **Source code for `{mod_id}`:**\n{source_url}")
+                        await interaction.followup.send(f"**source for `{mod_id}`:**\n{source_url}")
                     else:
-                        await interaction.followup.send(f"❌ No source code link was found on the index for `{mod_id}`.")
+                        await interaction.followup.send(f"no source code link found for `{mod_id}`.")
                 elif r.status == 404:
-                    await interaction.followup.send(f"❌ Mod `{mod_id}` not found on the index.")
+                    await interaction.followup.send(f"mod `{mod_id}` not found.")
                 else:
-                    await interaction.followup.send(f"❌ API Error: HTTP {r.status}")
+                    await interaction.followup.send(f"api error: http {r.status}")
         except Exception as e:
-            await interaction.followup.send(f"❌ Error fetching mod repository: {format_error_reason(e)}")
+            await interaction.followup.send(f"error fetching repo: {format_error_reason(e)}")
 
-    # --- HELP ---
     elif cmd == "help":
-        embed = discord.Embed(title="Geode Developer - Common Issues", color=discord.Color.red())
+        embed = discord.Embed(title="dev troubleshooting", color=0xe74c3c)
         embed.add_field(
-            name="Missing Headers / Bindings Not Found", 
-            value="Ensure you ran `geode build` (or your CMake configure step) to generate the GD bindings. If your IDE still warns, try reloading your CMake project.", 
+            name="missing headers / bindings", 
+            value="run `geode build` (or your cmake configure) to generate bindings. if your IDE warns, reload the cmake project.", 
             inline=False
         )
         embed.add_field(
-            name="CMake Not Found", 
-            value="Make sure CMake is installed and added to your system `PATH` variable.", 
+            name="cmake not found", 
+            value="make sure cmake is installed and on your system `PATH`.", 
             inline=False
         )
         embed.add_field(
-            name="Linker Errors (LNK2001 / LNK2019)", 
-            value="Usually caused by an incorrect function signature inside your `$modify` block, or missing a `GEODE_API` macro on an exported class.", 
+            name="linker errors (LNK2001/LNK2019)", 
+            value="usually an incorrect signature in your `$modify` block, or missing `GEODE_API` on an exported class.", 
             inline=False
         )
         embed.add_field(
-            name="Game Crashes Immediately", 
-            value="Double check your dependencies in `mod.json` and ensure you aren't trying to access layers before they are fully initialized.", 
+            name="game crashes instantly", 
+            value="check dependencies in `mod.json`. ensure you aren't accessing layers before they init.", 
             inline=False
         )
         embed.add_field(
-            name="Need More Info?", 
-            value="Check out the [Troubleshooting Guide](https://docs.geode-sdk.org/troubleshooting) in the official docs.", 
+            name="more info", 
+            value="[troubleshooting guide](https://docs.geode-sdk.org/troubleshooting)", 
             inline=False
         )
         await interaction.response.send_message(embed=embed)
