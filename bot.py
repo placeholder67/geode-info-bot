@@ -1,13 +1,8 @@
-"""
-geode api because: https://api.geode-sdk.org/swagger/
-"""
-
 import asyncio
 import json
 import logging
 import os
 import urllib.parse
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, List
 
@@ -22,10 +17,30 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("geode")
 
 
-def unwrap(data: Any) -> dict:
-    if isinstance(data, dict) and isinstance(data.get("payload"), dict):
-        return data["payload"]
-    return data if isinstance(data, dict) else {}
+def normalize_single_mod_response(data: Any) -> dict:
+    """Safely extracts a single mod object regardless of how the API wraps it."""
+    if isinstance(data, dict):
+        payload = data.get("payload", data)
+        if isinstance(payload, dict):
+            # Sometimes the payload itself contains a 'data' object
+            if "data" in payload and isinstance(payload["data"], dict):
+                return payload["data"]
+            return payload
+    return {}
+
+
+def normalize_list_response(data: Any) -> dict:
+    """Safely extracts a list of mods and count from the API response."""
+    if isinstance(data, list):
+        return {"count": len(data), "data": data}
+    if isinstance(data, dict):
+        payload = data.get("payload", data)
+        if isinstance(payload, list):
+            return {"count": len(payload), "data": payload}
+        if isinstance(payload, dict):
+            if "data" in payload and isinstance(payload["data"], list):
+                return payload
+    return {"count": 0, "data": []}
 
 
 def is_pending(d: dict) -> bool:
@@ -37,21 +52,54 @@ def is_pending(d: dict) -> bool:
     first_version = versions[0]
     if not isinstance(first_version, dict):
         return False
+    
     status = first_version.get("status")
-    return status != "accepted"
+    if status:
+        return status not in ("accepted", "approved")
+    return False
 
 
 def find_version(d: dict) -> Optional[str]:
     if not isinstance(d, dict):
         return None
+        
+    # Check top-level properties first (API V1 standard)
+    if "version" in d and isinstance(d["version"], str):
+        return d["version"]
+    if "latest_version" in d and isinstance(d["latest_version"], str):
+        return d["latest_version"]
+        
+    # Fallback to versions array
     versions = d.get("versions")
-    if not isinstance(versions, list) or not versions:
-        return None
-    first_version = versions[0]
-    if not isinstance(first_version, dict):
-        return None
-    version = first_version.get("version")
-    return version if isinstance(version, str) else None
+    if isinstance(versions, list) and len(versions) > 0:
+        first_version = versions[0]
+        if isinstance(first_version, dict):
+            return first_version.get("version")
+            
+    return None
+
+
+def find_developer(mod_data: dict) -> str:
+    if not isinstance(mod_data, dict):
+        return "Unknown Developer"
+        
+    dev = mod_data.get("developer")
+    if dev and isinstance(dev, str):
+        return dev
+        
+    developers = mod_data.get("developers")
+    if isinstance(developers, list) and len(developers) > 0:
+        first = developers[0]
+        if isinstance(first, str):
+            return first
+        if isinstance(first, dict):
+            return first.get("display_name") or first.get("username") or "Unknown Developer"
+            
+    owner = mod_data.get("owner")
+    if owner and isinstance(owner, str):
+        return owner
+        
+    return "Unknown Developer"
 
 
 def find_downloads(d: dict) -> Optional[int]:
@@ -101,10 +149,10 @@ def format_error_reason(error: Any) -> str:
 
 
 def build_single_mod_embed(mod_data: dict) -> discord.Embed:
-    name = mod_data.get("name", "Unknown Mod")
-    mod_id = mod_data.get("id", "unknown.id")
-    dev = mod_data.get("developer", "Unknown Developer")
-    desc = mod_data.get("description", "No description provided.")
+    mod_id = mod_data.get("id") or "unknown.id"
+    name = mod_data.get("name") or mod_id
+    dev = find_developer(mod_data)
+    desc = mod_data.get("description") or "No description provided."
     version = find_version(mod_data) or "Unknown"
     downloads = find_downloads(mod_data)
     pending = is_pending(mod_data)
@@ -142,9 +190,9 @@ def build_list_embed(title: str, mods: list, page: int, total_pages: int) -> dis
     lines = []
     
     for i, m in enumerate(mods, 1):
-        name = m.get("name", "Unknown")
-        mod_id = m.get("id", "unknown.id")
-        dev = m.get("developer", "Unknown")
+        mod_id = m.get("id") or "unknown.id"
+        name = m.get("name") or mod_id
+        dev = find_developer(m)
         dl = find_downloads(m) or 0
         lines.append(f"**{i}. [{name}](https://geode-sdk.org/mods/{mod_id})** by {dev}\n> 📦 `{mod_id}` • ⬇️ {dl:,} downloads")
 
@@ -161,8 +209,8 @@ class ModSelect(discord.ui.Select):
     def __init__(self, mods: list):
         options = []
         for m in mods:
-            name = m.get("name", "Unknown")[:90]
-            mod_id = m.get("id", "unknown.id")[:90]
+            mod_id = (m.get("id") or "unknown.id")[:90]
+            name = (m.get("name") or mod_id)[:90]
             options.append(discord.SelectOption(label=name, description=mod_id, value=mod_id))
             
         super().__init__(
@@ -174,14 +222,16 @@ class ModSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         mod_id = self.values[0]
+        # Defer response to handle API fetch latency safely
+        await interaction.response.defer(ephemeral=True)
         mod_data = await interaction.client.fetch_single_mod(mod_id)
         
         if "error" in mod_data:
-            await interaction.response.send_message(f"❌ Oops, ran into an issue fetching that mod: {mod_data['error']}", ephemeral=True)
+            await interaction.followup.send(f"❌ Oops, ran into an issue fetching that mod: {mod_data['error']}", ephemeral=True)
             return
             
         embed = build_single_mod_embed(mod_data)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class ModSearchView(discord.ui.View):
@@ -196,7 +246,6 @@ class ModSearchView(discord.ui.View):
         self.mods = []
 
     async def load_data(self):
-        # We fetch based on downloads to naturally sort by trend/popularity
         data = await self.bot.fetch_mods_list(query=self.query, sort="downloads", page=self.page, per_page=self.per_page)
         self.mods = data.get("data", [])
         count = data.get("count", 0)
@@ -258,7 +307,7 @@ class Bot(commands.Bot):
                     return {"error": "Mod not found."}
                 r.raise_for_status()
                 data = await r.json()
-                return unwrap(data)
+                return normalize_single_mod_response(data)
         except Exception as e:
             return {"error": format_error_reason(e)}
 
@@ -274,14 +323,13 @@ class Bot(commands.Bot):
             async with self.session.get(url, params=params) as r:
                 if r.status == 200:
                     data = await r.json()
-                    return unwrap(data)
+                    return normalize_list_response(data)
                 return {"count": 0, "data": []}
         except Exception:
             return {"count": 0, "data": []}
 
 
 bot = Bot()
-
 
 # ==========================================
 # GEODE COMMANDS
@@ -303,7 +351,6 @@ async def checkforupdates(
     await interaction.response.defer()
 
     if mod_id:
-        # User requested a specific mod ID
         mod_data = await bot.fetch_single_mod(mod_id)
         if "error" in mod_data:
             return await interaction.followup.send(f"❌ {mod_data['error']}")
@@ -312,13 +359,11 @@ async def checkforupdates(
         await interaction.followup.send(embed=embed)
         
     elif search:
-        # User is searching for a mod
         view = ModSearchView(bot, query=search, is_trending=False)
         embed = await view.generate_view()
         await interaction.followup.send(embed=embed, view=view)
         
     else:
-        # No arguments provided - show trending
         view = ModSearchView(bot, query=None, is_trending=True)
         embed = await view.generate_view()
         await interaction.followup.send(embed=embed, view=view)
@@ -329,17 +374,16 @@ async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, cur
     if not current:
         return []
     
-    # Dynamically fetch matching mods from the API as they type
     data = await bot.fetch_mods_list(query=current, sort="downloads", page=1, per_page=15)
     mods = data.get("data", [])
     
-    return [
-        discord.app_commands.Choice(
-            name=f"{m.get('name')} ({m.get('id')})", 
-            value=m.get('id')
-        )
-        for m in mods
-    ][:25]
+    choices = []
+    for m in mods:
+        mod_id = m.get('id') or "unknown"
+        name = m.get('name') or mod_id
+        choices.append(discord.app_commands.Choice(name=f"{name} ({mod_id})", value=mod_id))
+        
+    return choices[:25]
 
 
 @bot.tree.command(
@@ -352,7 +396,6 @@ async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, cur
 async def erymanthus(interaction: discord.Interaction, search: str):
     await interaction.response.defer()
 
-    # Fetching with page=1 and per_page=5 to make it blazing fast
     data = await bot.fetch_mods_list(query=search, sort="downloads", page=1, per_page=5)
     mods = data.get("data", [])
 
@@ -373,8 +416,8 @@ async def erymanthus(interaction: discord.Interaction, search: str):
         )
 
         for m in mods:
-            name = m.get("name", "Unknown")
-            mod_id = m.get("id", "unknown.id")
+            mod_id = m.get("id") or "unknown.id"
+            name = m.get("name") or mod_id
             desc = m.get("description", "No description.")[:100]
             
             if len(m.get("description", "")) > 100:
@@ -452,10 +495,8 @@ async def dev(
             async with bot.session.get(api_url.format("geode.loader")) as r:
                 if r.status == 200:
                     data = await r.json()
-                    payload = data.get("payload", {})
-                    versions = payload.get("versions", [])
-                    if versions:
-                        loader_ver = versions[0].get("version", "Unknown")
+                    mod_obj = normalize_single_mod_response(data)
+                    loader_ver = find_version(mod_obj) or "Unknown"
         except Exception:
             pass
 
@@ -496,10 +537,16 @@ async def dev(
             async with bot.session.get(api_url.format(mod_id)) as r:
                 if r.status == 200:
                     data = await r.json()
-                    payload = data.get("payload", {})
-                    links = payload.get("links", {})
-                    source_url = links.get("source")
+                    mod_obj = normalize_single_mod_response(data)
                     
+                    # Search multiple common JSON paths for the repository URL
+                    source_url = None
+                    links = mod_obj.get("links")
+                    if isinstance(links, dict):
+                        source_url = links.get("source") or links.get("repository")
+                    if not source_url:
+                        source_url = mod_obj.get("repository") or mod_obj.get("source")
+                        
                     if source_url:
                         await interaction.followup.send(f"🔗 **Source code for `{mod_id}`:**\n{source_url}")
                     else:
