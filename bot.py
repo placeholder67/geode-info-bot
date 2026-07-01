@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import urllib.parse
+import random
+import string
 from datetime import datetime, timezone
 from typing import Any, Optional, List
 
@@ -597,6 +599,11 @@ async def dev(
         )
         await interaction.response.send_message(embed=embed)
 
+@bot.tree.command(name="ery_string_generator", description="ERY STRING GENERATOR")
+async def ery_string_generator(interaction: discord.Interaction):
+    random_chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=64))
+    magic_string = f"ERYMANTHUS_MAGIC_STRING_TRIGGER_ACCEPT_MY_MOD_{random_chars}"
+    await interaction.response.send_message(f"```\n{magic_string}\n```")
 
 def main():
     if not token:
