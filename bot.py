@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Optional, List
@@ -15,6 +16,31 @@ api_url = "https://api.geode-sdk.org/v1/mods/{}"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("geode")
+
+# ==========================================
+# BANNED WORDS FILTER
+# ==========================================
+BANNED_WORDS = [
+    "nigger",
+    "nigga",
+    "faggot",
+    "fag",
+    "dyke",
+    "tranny",
+    "kys",
+    "retard"
+]
+
+def contains_banned_word(text: str) -> bool:
+    """Checks if the text contains any explicitly banned words using word boundaries."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    for banned in BANNED_WORDS:
+        # \b ensures we only match whole words (e.g., 'fag' won't block 'defag')
+        if re.search(rf"\b{re.escape(banned)}\b", text_lower):
+            return True
+    return False
 
 
 def normalize_single_mod_response(data: Any) -> dict:
@@ -194,7 +220,12 @@ def build_list_embed(title: str, mods: list, page: int, total_pages: int) -> dis
         name = m.get("name") or mod_id
         dev = find_developer(m)
         dl = find_downloads(m) or 0
-        lines.append(f"**{i}. [{name}](https://geode-sdk.org/mods/{mod_id})** by {dev}\n> 📦 `{mod_id}` • ⬇️ {dl:,} downloads")
+        desc = m.get("description", "No description.")
+        
+        if len(desc) > 30:
+            desc = desc[:27] + "..."
+            
+        lines.append(f"**{i}. [{name}](https://geode-sdk.org/mods/{mod_id})** by {dev}\n> {desc}\n> 📦 `{mod_id}` • ⬇️ {dl:,} downloads")
 
     if not lines:
         embed.description = "*No mods found. Try a different search!*"
@@ -211,7 +242,12 @@ class ModSelect(discord.ui.Select):
         for m in mods:
             mod_id = (m.get("id") or "unknown.id")[:90]
             name = (m.get("name") or mod_id)[:90]
-            options.append(discord.SelectOption(label=name, description=mod_id, value=mod_id))
+            desc = m.get("description", "No description.")
+            
+            if len(desc) > 30:
+                desc = desc[:27] + "..."
+                
+            options.append(discord.SelectOption(label=name, description=desc, value=mod_id))
             
         super().__init__(
             placeholder="Select a mod from this page to see its info...",
@@ -348,6 +384,9 @@ async def checkforupdates(
     mod_id: Optional[str] = None,
     search: Optional[str] = None,
 ):
+    if (search and contains_banned_word(search)) or (mod_id and contains_banned_word(mod_id)):
+        return await interaction.response.send_message("❌ Search blocked: Contains inappropriate language.", ephemeral=True)
+
     await interaction.response.defer()
 
     if mod_id:
@@ -371,7 +410,7 @@ async def checkforupdates(
 
 @checkforupdates.autocomplete("mod_id")
 async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, current: str):
-    if not current:
+    if not current or contains_banned_word(current):
         return []
     
     data = await bot.fetch_mods_list(query=current, sort="downloads", page=1, per_page=15)
@@ -394,6 +433,9 @@ async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, cur
     search="Describe your mod idea to see if it exists"
 )
 async def erymanthus(interaction: discord.Interaction, search: str):
+    if contains_banned_word(search):
+        return await interaction.response.send_message("❌ Search blocked: Contains inappropriate language.", ephemeral=True)
+
     await interaction.response.defer()
 
     data = await bot.fetch_mods_list(query=search, sort="downloads", page=1, per_page=5)
@@ -418,10 +460,10 @@ async def erymanthus(interaction: discord.Interaction, search: str):
         for m in mods:
             mod_id = m.get("id") or "unknown.id"
             name = m.get("name") or mod_id
-            desc = m.get("description", "No description.")[:100]
+            desc = m.get("description", "No description.")
             
-            if len(m.get("description", "")) > 100:
-                desc += "..."
+            if len(desc) > 30:
+                desc = desc[:27] + "..."
                 
             embed.description += f"**[{name}](https://geode-sdk.org/mods/{mod_id})** (`{mod_id}`)\n> {desc}\n\n"
 
@@ -455,6 +497,10 @@ async def dev(
     mod_id: Optional[str] = None
 ):
     cmd = command.value
+
+    # Check for banned words in optional inputs
+    if (topic and contains_banned_word(topic)) or (mod_id and contains_banned_word(mod_id)):
+        return await interaction.response.send_message("❌ Command blocked: Contains inappropriate language.", ephemeral=True)
 
     # --- DOCS ---
     if cmd == "docs":
