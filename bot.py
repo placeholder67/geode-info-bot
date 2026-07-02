@@ -186,21 +186,9 @@ def find_name(d: dict, mod_id: str) -> str:
             
     return mod_id
 
-def find_logo(d: dict) -> Optional[str]:
-    """Robustly dig for the mod logo URL."""
-    if not isinstance(d, dict):
-        return None
-        
-    if d.get("logo") and isinstance(d.get("logo"), str):
-        return d["logo"]
-        
-    versions = d.get("versions")
-    if isinstance(versions, list) and versions:
-        v = versions[0]
-        if isinstance(v, dict) and v.get("logo") and isinstance(v.get("logo"), str):
-            return v["logo"]
-            
-    return None
+def find_logo(mod_id: str) -> str:
+    """Uses Geode's direct API endpoint for the highest res logo."""
+    return f"https://api.geode-sdk.org/v1/mods/{mod_id}/logo"
 
 def format_error_reason(error: Any) -> str:
     text = str(error).strip() if error is not None else "unknown error"
@@ -216,7 +204,7 @@ def build_single_mod_embed(mod_data: dict) -> discord.Embed:
     downloads = find_downloads(mod_data)
     pending = is_pending(mod_data)
     url = find_mod_url(mod_data, mod_id)
-    logo = find_logo(mod_data)
+    logo = find_logo(mod_id)
 
     color = 0xffd700 if pending else 0x2ecc71
 
@@ -229,9 +217,7 @@ def build_single_mod_embed(mod_data: dict) -> discord.Embed:
     )
     
     embed.set_author(name=f"by {dev}")
-    
-    if logo:
-        embed.set_thumbnail(url=logo)
+    embed.set_thumbnail(url=logo)
     
     dl_text = f"{downloads:,}" if downloads is not None else "n/a"
     status_text = "pending" if pending else "verified"
@@ -247,9 +233,14 @@ def build_single_mod_embed(mod_data: dict) -> discord.Embed:
     embed.set_footer(text="geode index")
     return embed
 
-def build_list_embed(title: str, mods: list, page: int, total_pages: int) -> discord.Embed:
-    embed = discord.Embed(title=title, color=0x5865F2)
-    lines = []
+def build_list_embeds(title: str, mods: list, page: int, total_pages: int) -> list[discord.Embed]:
+    """Returns a list of embeds so each mod can have a small thumbnail logo on the right."""
+    if not mods:
+        embed = discord.Embed(title=title, description="*no mods found.*", color=0x5865F2)
+        embed.set_footer(text=f"page {page}/{max(1, total_pages)}")
+        return [embed]
+
+    embeds = []
     
     for i, m in enumerate(mods, 1):
         mod_id = m.get("id") or "unknown.id"
@@ -257,19 +248,25 @@ def build_list_embed(title: str, mods: list, page: int, total_pages: int) -> dis
         dev = find_developer(m)
         dl = find_downloads(m) or 0
         desc = find_description(m)
+        logo = find_logo(mod_id)
         
         if len(desc) > 85:
             desc = desc[:82] + "..."
             
-        lines.append(f"**{i}. [{name}](https://geode-sdk.org/mods/{mod_id})** by {dev}\n> {desc}\n> 📦 `{mod_id}` • ⬇️ {dl:,}")
+        text = f"**{i}. [{name}](https://geode-sdk.org/mods/{mod_id})** by {dev}\n> {desc}\n> 📦 `{mod_id}` • ⬇️ {dl:,}"
 
-    if not lines:
-        embed.description = "*no mods found.*"
-    else:
-        embed.description = "\n\n".join(lines)
+        embed = discord.Embed(description=text, color=0x5865F2)
+        if i == 1:
+            embed.title = title
+            
+        embed.set_thumbnail(url=logo)
+        embeds.append(embed)
 
-    embed.set_footer(text=f"page {page}/{max(1, total_pages)}")
-    return embed
+    # Attach footer strictly to the last embed in the cluster
+    if embeds:
+        embeds[-1].set_footer(text=f"page {page}/{max(1, total_pages)}")
+
+    return embeds
 
 class ModSelect(discord.ui.Select):
     def __init__(self, mods: list):
@@ -279,7 +276,6 @@ class ModSelect(discord.ui.Select):
             name = find_name(m, mod_id)[:90]
             desc = find_description(m)
             
-            # discord limits select descriptions to 100 chars
             if len(desc) > 95:
                 desc = desc[:92] + "..."
                 
@@ -337,19 +333,19 @@ class ModSearchView(discord.ui.View):
         await self.load_data()
         self.update_items()
         title = "trending mods" if self.is_trending else f"search: {self.query}"
-        return build_list_embed(title, self.mods, self.page, self.total_pages)
+        return build_list_embeds(title, self.mods, self.page, self.total_pages)
 
     @discord.ui.button(label="<", style=discord.ButtonStyle.secondary, custom_id="prev")
     async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page -= 1
-        embed = await self.generate_view()
-        await interaction.response.edit_message(embed=embed, view=self)
+        embeds = await self.generate_view()
+        await interaction.response.edit_message(embeds=embeds, view=self)
 
     @discord.ui.button(label=">", style=discord.ButtonStyle.secondary, custom_id="next")
     async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page += 1
-        embed = await self.generate_view()
-        await interaction.response.edit_message(embed=embed, view=self)
+        embeds = await self.generate_view()
+        await interaction.response.edit_message(embeds=embeds, view=self)
 
 class Bot(commands.Bot):
     def __init__(self):
@@ -399,6 +395,22 @@ class Bot(commands.Bot):
 
 bot = Bot()
 
+# Core logic used by both checkforupdates and dev autocompletes
+async def mod_autocomplete_logic(current: str):
+    if not current or contains_banned_word(current):
+        return []
+    
+    data = await bot.fetch_mods_list(query=current, sort="downloads", page=1, per_page=15)
+    mods = data.get("data", [])
+    
+    choices = []
+    for m in mods:
+        mod_id = m.get('id') or "unknown"
+        name = find_name(m, mod_id)
+        choices.append(discord.app_commands.Choice(name=f"{name} ({mod_id})", value=mod_id))
+        
+    return choices[:25]
+
 # geode commands
 
 @bot.tree.command(name="checkforupdates", description="browse trending geode mods or search the index")
@@ -426,29 +438,17 @@ async def checkforupdates(
         
     elif search:
         view = ModSearchView(bot, query=search, is_trending=False)
-        embed = await view.generate_view()
-        await interaction.followup.send(embed=embed, view=view)
+        embeds = await view.generate_view()
+        await interaction.followup.send(embeds=embeds, view=view)
         
     else:
         view = ModSearchView(bot, query=None, is_trending=True)
-        embed = await view.generate_view()
-        await interaction.followup.send(embed=embed, view=view)
+        embeds = await view.generate_view()
+        await interaction.followup.send(embeds=embeds, view=view)
 
 @checkforupdates.autocomplete("mod_id")
 async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, current: str):
-    if not current or contains_banned_word(current):
-        return []
-    
-    data = await bot.fetch_mods_list(query=current, sort="downloads", page=1, per_page=15)
-    mods = data.get("data", [])
-    
-    choices = []
-    for m in mods:
-        mod_id = m.get('id') or "unknown"
-        name = find_name(m, mod_id)
-        choices.append(discord.app_commands.Choice(name=f"{name} ({mod_id})", value=mod_id))
-        
-    return choices[:25]
+    return await mod_autocomplete_logic(current)
 
 @bot.tree.command(name="erymanthus", description="check if someone has already made your mod idea")
 @discord.app_commands.describe(search="describe your mod idea")
@@ -491,91 +491,23 @@ async def erymanthus(interaction: discord.Interaction, search: str):
 @bot.tree.command(name="dev", description="developer utilities for geode")
 @discord.app_commands.describe(
     command="utility command to run",
-    topic="fetch a specific topic (only for 'docs')",
-    mod_id="mod id (only for 'repo', e.g., geode.loader)"
+    mod_id="mod id (only for 'repo', autocompletes from api)"
 )
 @discord.app_commands.choices(command=[
-    discord.app_commands.Choice(name="docs", value="docs"),
-    discord.app_commands.Choice(name="cli", value="cli"),
-    discord.app_commands.Choice(name="status", value="status"),
-    discord.app_commands.Choice(name="template", value="template"),
     discord.app_commands.Choice(name="repo", value="repo"),
-    discord.app_commands.Choice(name="help", value="help"),
+    discord.app_commands.Choice(name="ery string generator", value="ery_string_generator"),
 ])
 async def dev(
     interaction: discord.Interaction, 
     command: discord.app_commands.Choice[str], 
-    topic: Optional[str] = None, 
     mod_id: Optional[str] = None
 ):
     cmd = command.value
 
-    if (topic and contains_banned_word(topic)) or (mod_id and contains_banned_word(mod_id)):
+    if mod_id and contains_banned_word(mod_id):
         return await interaction.response.send_message("blocked: contains banned words.", ephemeral=True)
 
-    if cmd == "docs":
-        base_url = "https://docs.geode-sdk.org/"
-        if topic:
-            query = urllib.parse.quote(topic)
-            await interaction.response.send_message(f"docs search for **{topic}**: {base_url}?q={query}")
-        else:
-            await interaction.response.send_message(f"geode docs: {base_url}")
-
-    elif cmd == "cli":
-        embed = discord.Embed(title="cli quick-start", color=0x2ecc71)
-        embed.add_field(name="`geode new`", value="create a new geode project.", inline=False)
-        embed.add_field(name="`geode build`", value="configure and build the project.", inline=False)
-        embed.add_field(name="`geode package`", value="package into a `.geode` file.", inline=False)
-        embed.add_field(name="`geode run`", value="run geometry dash with geode.", inline=False)
-        embed.add_field(name="`geode profile`", value="manage profiles.", inline=False)
-        await interaction.response.send_message(embed=embed)
-
-    elif cmd == "status":
-        await interaction.response.defer()
-        
-        api_status = "unknown"
-        loader_ver = "unknown"
-
-        try:
-            async with bot.session.get("https://api.geode-sdk.org/") as r:
-                api_status = "online" if r.status in (200, 404) else f"http {r.status}"
-        except Exception:
-            api_status = "offline"
-
-        try:
-            async with bot.session.get(api_url.format("geode.loader")) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    mod_obj = normalize_single_mod_response(data)
-                    loader_ver = find_version(mod_obj) or "unknown"
-        except Exception:
-            pass
-
-        embed = discord.Embed(title="geode api status", color=0x5865F2)
-        embed.add_field(name="api", value=api_status, inline=True)
-        embed.add_field(name="loader ver", value=loader_ver, inline=True)
-        embed.add_field(name="docs", value="[swagger](https://api.geode-sdk.org/swagger/)", inline=False)
-        
-        await interaction.followup.send(embed=embed)
-
-    elif cmd == "template":
-        code = (
-            "```cpp\n"
-            "#include <Geode/Geode.hpp>\n"
-            "#include <Geode/modify/MenuLayer.hpp>\n\n"
-            "using namespace geode::prelude;\n\n"
-            "class $modify(MyMenuLayer, MenuLayer) {\n"
-            "    bool init() {\n"
-            "        if (!MenuLayer::init()) return false;\n\n"
-            "        FLAlertLayer::create(\"Geode\", \"Hello World!\", \"OK\")->show();\n\n"
-            "        return true;\n"
-            "    }\n"
-            "};\n"
-            "```"
-        )
-        await interaction.response.send_message(f"basic geode boilerplate:\n{code}")
-
-    elif cmd == "repo":
+    if cmd == "repo":
         if not mod_id:
             return await interaction.response.send_message("error: provide a `mod_id` to use repo command.", ephemeral=True)
 
@@ -605,41 +537,22 @@ async def dev(
         except Exception as e:
             await interaction.followup.send(f"error fetching repo: {format_error_reason(e)}")
 
-    elif cmd == "help":
-        embed = discord.Embed(title="dev troubleshooting", color=0xe74c3c)
-        embed.add_field(
-            name="missing headers / bindings", 
-            value="run `geode build` (or your cmake configure) to generate bindings. if your IDE warns, reload the cmake project.", 
-            inline=False
+    elif cmd == "ery_string_generator":
+        random_chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=64))
+        magic_string = f"ERYMANTHUS_MAGIC_STRING_TRIGGER_ACCEPT_MY_MOD_{random_chars}"
+        
+        embed = discord.Embed(
+            title="magic string generator", 
+            description="generate a cryptographically secure magic string to bypass erymanthus check",
+            color=0x9b59b6
         )
-        embed.add_field(
-            name="cmake not found", 
-            value="make sure cmake is installed and on your system `PATH`.", 
-            inline=False
-        )
-        embed.add_field(
-            name="linker errors (LNK2001/LNK2019)", 
-            value="usually an incorrect signature in your `$modify` block, or missing `GEODE_API` on an exported class.", 
-            inline=False
-        )
-        embed.add_field(
-            name="game crashes instantly", 
-            value="check dependencies in `mod.json`. ensure you aren't accessing layers before they init.", 
-            inline=False
-        )
-        embed.add_field(
-            name="more info", 
-            value="[troubleshooting guide](https://docs.geode-sdk.org/troubleshooting)", 
-            inline=False
-        )
+        embed.add_field(name="output", value=f"```\n{magic_string}\n```")
         await interaction.response.send_message(embed=embed)
-'''
-@bot.tree.command(name="ery_string_generator", description="ERY STRING GENERATOR")
-async def ery_string_generator(interaction: discord.Interaction):
-    random_chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=64))
-    magic_string = f"ERYMANTHUS_MAGIC_STRING_TRIGGER_ACCEPT_MY_MOD_{random_chars}"
-    await interaction.response.send_message(f"```\n{magic_string}\n```")
-'''
+
+@dev.autocomplete("mod_id")
+async def dev_mod_autocomplete(interaction: discord.Interaction, current: str):
+    return await mod_autocomplete_logic(current)
+
 def main():
     if not token:
         raise RuntimeError("DISCORD_TOKEN missing")
