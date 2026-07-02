@@ -196,6 +196,7 @@ def format_error_reason(error: Any) -> str:
     return text[:180] or "unknown error"
 
 def build_single_mod_embed(mod_data: dict) -> discord.Embed:
+    """Standard detailed view. This remains unchanged in size."""
     mod_id = mod_data.get("id") or "unknown.id"
     name = find_name(mod_data, mod_id)
     dev = find_developer(mod_data)
@@ -234,7 +235,7 @@ def build_single_mod_embed(mod_data: dict) -> discord.Embed:
     return embed
 
 def build_list_embeds(title: str, mods: list, page: int, total_pages: int) -> list[discord.Embed]:
-    """Returns a list of embeds so each mod can have a small thumbnail logo on the right."""
+    """Returns a slimmer list of embeds by using the author slot for the logo."""
     if not mods:
         embed = discord.Embed(title=title, description="*no mods found.*", color=0x5865F2)
         embed.set_footer(text=f"page {page}/{max(1, total_pages)}")
@@ -253,13 +254,17 @@ def build_list_embeds(title: str, mods: list, page: int, total_pages: int) -> li
         if len(desc) > 85:
             desc = desc[:82] + "..."
             
-        text = f"**{i}. [{name}](https://geode-sdk.org/mods/{mod_id})** by {dev}\n> {desc}\n> 📦 `{mod_id}` • ⬇️ {dl:,}"
+        # Compacted text formatting to save vertical space
+        text = f"*{desc}*\n📦 `{mod_id}` • ⬇️ {dl:,}"
 
         embed = discord.Embed(description=text, color=0x5865F2)
         if i == 1:
             embed.title = title
             
-        embed.set_thumbnail(url=logo)
+        # Moving the logo to the author icon prevents the embed from 
+        # vertically expanding to fit a huge thumbnail
+        embed.set_author(name=f"{i}. {name} (by {dev})", icon_url=logo, url=f"https://geode-sdk.org/mods/{mod_id}")
+        
         embeds.append(embed)
 
     # Attach footer strictly to the last embed in the cluster
@@ -300,6 +305,32 @@ class ModSelect(discord.ui.Select):
         embed = build_single_mod_embed(mod_data)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+class PageModal(discord.ui.Modal, title="Jump to Page"):
+    page_num = discord.ui.TextInput(
+        label="Page Number",
+        style=discord.TextStyle.short,
+        placeholder="Enter page...",
+        required=True
+    )
+
+    def __init__(self, view: "ModSearchView"):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            new_page = int(self.page_num.value.strip())
+            if new_page < 1:
+                new_page = 1
+            elif new_page > self.view.total_pages:
+                new_page = self.view.total_pages
+
+            self.view.page = new_page
+            embeds = await self.view.generate_view()
+            await interaction.response.edit_message(embeds=embeds, view=self.view)
+        except ValueError:
+            await interaction.response.send_message("invalid page number.", ephemeral=True)
+
 class ModSearchView(discord.ui.View):
     def __init__(self, bot, query: str = None, is_trending: bool = False):
         super().__init__(timeout=300)
@@ -321,9 +352,11 @@ class ModSearchView(discord.ui.View):
         self.clear_items()
         
         self.btn_prev.disabled = self.page <= 1
+        self.btn_jump.disabled = self.total_pages <= 1
         self.btn_next.disabled = self.page >= self.total_pages
         
         self.add_item(self.btn_prev)
+        self.add_item(self.btn_jump)
         self.add_item(self.btn_next)
 
         if self.mods:
@@ -340,6 +373,10 @@ class ModSearchView(discord.ui.View):
         self.page -= 1
         embeds = await self.generate_view()
         await interaction.response.edit_message(embeds=embeds, view=self)
+
+    @discord.ui.button(label="Page...", style=discord.ButtonStyle.secondary, custom_id="jump")
+    async def btn_jump(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(PageModal(self))
 
     @discord.ui.button(label=">", style=discord.ButtonStyle.secondary, custom_id="next")
     async def btn_next(self, interaction: discord.Interaction, button: discord.ui.Button):
