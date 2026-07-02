@@ -391,10 +391,15 @@ class Bot(commands.Bot):
         log.info("slash commands synced")
 
     async def update_presence(self):
+        total_members = sum(
+            guild.member_count or 0
+            for guild in self.guilds
+        )
+
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
-                name=f"the geode index <3 | {len(self.guilds):,} servers"
+                name=f"the geode index <3 | {len(self.guilds):,} servers | {total_members:,} members"
             )
         )
 
