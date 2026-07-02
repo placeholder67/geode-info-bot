@@ -442,7 +442,7 @@ async def mod_autocomplete_logic(current: str):
 
 # geode commands
 
-@bot.tree.command(name="checkforupdates", description="browse trending geode mods or search the index")
+@bot.tree.command(name="getindex", description="browse trending geode mods or search the index")
 @discord.app_commands.describe(
     mod_id="specific mod to view (autocompletes from api)",
     search="search mod by name",
