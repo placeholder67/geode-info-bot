@@ -152,7 +152,6 @@ def find_mod_url(d: dict, mod_id: str) -> str:
     return f"https://geode-sdk.org/mods/{mod_id}"
 
 def find_description(d: dict) -> str:
-    """Robustly dig for the description since the API moves it around."""
     if not isinstance(d, dict):
         return "no description"
         
@@ -171,7 +170,6 @@ def find_description(d: dict) -> str:
     return "no description"
 
 def find_name(d: dict, mod_id: str) -> str:
-    """Robustly dig for the mod title."""
     if not isinstance(d, dict):
         return mod_id
         
@@ -187,7 +185,6 @@ def find_name(d: dict, mod_id: str) -> str:
     return mod_id
 
 def find_logo(mod_id: str) -> str:
-    """Uses Geode's direct API endpoint for the highest res logo."""
     return f"https://api.geode-sdk.org/v1/mods/{mod_id}/logo"
 
 def format_error_reason(error: Any) -> str:
@@ -196,7 +193,6 @@ def format_error_reason(error: Any) -> str:
     return text[:180] or "unknown error"
 
 def build_single_mod_embed(mod_data: dict) -> discord.Embed:
-    """Standard detailed view. This remains unchanged in size."""
     mod_id = mod_data.get("id") or "unknown.id"
     name = find_name(mod_data, mod_id)
     dev = find_developer(mod_data)
@@ -234,16 +230,20 @@ def build_single_mod_embed(mod_data: dict) -> discord.Embed:
     embed.set_footer(text="geode index")
     return embed
 
-def build_list_embeds(title: str, mods: list, page: int, total_pages: int) -> list[discord.Embed]:
-    """Returns a slimmer list of embeds by using the author slot for the logo."""
-    if not mods:
-        embed = discord.Embed(title=title, description="*no mods found.*", color=0x5865F2)
-        embed.set_footer(text=f"page {page}/{max(1, total_pages)}")
-        return [embed]
+def build_list_embeds(title: str, mods: list, page: int, total_pages: int, per_page: int) -> list[discord.Embed]:
+    # Use a separate starting embed strictly for the title so Discord doesn't force it down
+    title_embed = discord.Embed(title=title, color=0x5865F2)
+    embeds = [title_embed]
 
-    embeds = []
+    if not mods:
+        title_embed.description = "*no mods found.*"
+        title_embed.set_footer(text=f"page {page}/{max(1, total_pages)}")
+        return embeds
+
+    # Calculate starting index so numbering continues across pages
+    start_idx = (page - 1) * per_page + 1
     
-    for i, m in enumerate(mods, 1):
+    for i, m in enumerate(mods, start_idx):
         mod_id = m.get("id") or "unknown.id"
         name = find_name(m, mod_id)
         dev = find_developer(m)
@@ -254,22 +254,15 @@ def build_list_embeds(title: str, mods: list, page: int, total_pages: int) -> li
         if len(desc) > 85:
             desc = desc[:82] + "..."
             
-        # Compacted text formatting to save vertical space
         text = f"*{desc}*\n📦 `{mod_id}` • ⬇️ {dl:,}"
 
         embed = discord.Embed(description=text, color=0x5865F2)
-        if i == 1:
-            embed.title = title
-            
-        # Moving the logo to the author icon prevents the embed from 
-        # vertically expanding to fit a huge thumbnail
         embed.set_author(name=f"{i}. {name} (by {dev})", icon_url=logo, url=f"https://geode-sdk.org/mods/{mod_id}")
         
         embeds.append(embed)
 
     # Attach footer strictly to the last embed in the cluster
-    if embeds:
-        embeds[-1].set_footer(text=f"page {page}/{max(1, total_pages)}")
+    embeds[-1].set_footer(text=f"page {page}/{max(1, total_pages)}")
 
     return embeds
 
@@ -332,13 +325,13 @@ class PageModal(discord.ui.Modal, title="Jump to Page"):
             await interaction.response.send_message("invalid page number.", ephemeral=True)
 
 class ModSearchView(discord.ui.View):
-    def __init__(self, bot, query: str = None, is_trending: bool = False):
+    def __init__(self, bot, query: str = None, is_trending: bool = False, per_page: int = 3):
         super().__init__(timeout=300)
         self.bot = bot
         self.query = query
         self.is_trending = is_trending
         self.page = 1
-        self.per_page = 5
+        self.per_page = per_page
         self.total_pages = 1
         self.mods = []
 
@@ -366,7 +359,7 @@ class ModSearchView(discord.ui.View):
         await self.load_data()
         self.update_items()
         title = "trending mods" if self.is_trending else f"search: {self.query}"
-        return build_list_embeds(title, self.mods, self.page, self.total_pages)
+        return build_list_embeds(title, self.mods, self.page, self.total_pages, self.per_page)
 
     @discord.ui.button(label="<", style=discord.ButtonStyle.secondary, custom_id="prev")
     async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -413,7 +406,7 @@ class Bot(commands.Bot):
         except Exception as e:
             return {"error": format_error_reason(e)}
 
-    async def fetch_mods_list(self, query: str = None, sort: str = "downloads", page: int = 1, per_page: int = 5) -> dict:
+    async def fetch_mods_list(self, query: str = None, sort: str = "downloads", page: int = 1, per_page: int = 3) -> dict:
         url = "https://api.geode-sdk.org/v1/mods"
         params = {"page": page, "per_page": per_page}
         if query:
@@ -432,7 +425,6 @@ class Bot(commands.Bot):
 
 bot = Bot()
 
-# Core logic used by both checkforupdates and dev autocompletes
 async def mod_autocomplete_logic(current: str):
     if not current or contains_banned_word(current):
         return []
@@ -453,12 +445,14 @@ async def mod_autocomplete_logic(current: str):
 @bot.tree.command(name="checkforupdates", description="browse trending geode mods or search the index")
 @discord.app_commands.describe(
     mod_id="specific mod to view (autocompletes from api)",
-    search="search mod by name"
+    search="search mod by name",
+    per_page="how many mods to show per page (1-5, default 3)"
 )
 async def checkforupdates(
     interaction: discord.Interaction,
     mod_id: Optional[str] = None,
     search: Optional[str] = None,
+    per_page: discord.app_commands.Range[int, 1, 5] = 3,
 ):
     if (search and contains_banned_word(search)) or (mod_id and contains_banned_word(mod_id)):
         return await interaction.response.send_message("blocked: contains banned words.", ephemeral=True)
@@ -474,12 +468,12 @@ async def checkforupdates(
         await interaction.followup.send(embed=embed)
         
     elif search:
-        view = ModSearchView(bot, query=search, is_trending=False)
+        view = ModSearchView(bot, query=search, is_trending=False, per_page=per_page)
         embeds = await view.generate_view()
         await interaction.followup.send(embeds=embeds, view=view)
         
     else:
-        view = ModSearchView(bot, query=None, is_trending=True)
+        view = ModSearchView(bot, query=None, is_trending=True, per_page=per_page)
         embeds = await view.generate_view()
         await interaction.followup.send(embeds=embeds, view=view)
 
@@ -488,14 +482,21 @@ async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, cur
     return await mod_autocomplete_logic(current)
 
 @bot.tree.command(name="erymanthus", description="check if someone has already made your mod idea")
-@discord.app_commands.describe(search="describe your mod idea")
-async def erymanthus(interaction: discord.Interaction, search: str):
+@discord.app_commands.describe(
+    search="describe your mod idea",
+    max_results="max results to show (1-5, default 3)"
+)
+async def erymanthus(
+    interaction: discord.Interaction, 
+    search: str,
+    max_results: discord.app_commands.Range[int, 1, 5] = 3
+):
     if contains_banned_word(search):
         return await interaction.response.send_message("blocked: contains banned words.", ephemeral=True)
 
     await interaction.response.defer()
 
-    data = await bot.fetch_mods_list(query=search, sort="downloads", page=1, per_page=5)
+    data = await bot.fetch_mods_list(query=search, sort="downloads", page=1, per_page=max_results)
     mods = data.get("data", [])
 
     if not mods:
