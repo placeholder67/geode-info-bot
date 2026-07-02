@@ -390,7 +390,7 @@ class Bot(commands.Bot):
         await self.tree.sync()
         log.info("slash commands synced")
 
-        async def update_presence(self):
+    async def update_presence(self):
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
