@@ -5,14 +5,15 @@ import re
 import random
 import string
 import time
+import json
 from datetime import datetime, timezone
-from typing import Any, Optional, Dict, Tuple
+from typing import Any, Optional, Dict, Tuple, List
 
 import aiohttp
 import discord
 from discord.ext import commands, tasks
 
-# --- ENV VARS ---
+# --- env vars ---
 token = (os.getenv("DISCORD_TOKEN") or "").strip()
 cf_account = (os.getenv("CF_ACCOUNT_ID") or "").strip()
 cf_db = (os.getenv("CF_DATABASE_ID") or "").strip()
@@ -22,6 +23,7 @@ if cf_token.lower().startswith("bearer "):
     cf_token = cf_token[7:].strip()
 
 api_url = "https://api.geode-sdk.org/v1/mods/{}"
+CACHE_FILE = "geode_cache.json"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("geode")
@@ -29,7 +31,8 @@ log = logging.getLogger("geode")
 _API_CACHE: Dict[str, Tuple[float, Any]] = {}
 CACHE_TTL = 300  
 
-_ALL_MODS_CACHE = []
+_ALL_MODS_CACHE: List[dict] = []
+_INDEX_MAP: Dict[str, List[dict]] = {}
 
 def get_cached_response(key: str):
     if key in _API_CACHE:
@@ -58,7 +61,45 @@ def contains_banned_word(text: str) -> bool:
             return True
     return False
 
-# --- CLOUDFLARE D1 TRACKER ---
+# --- local file storage ---
+def save_cache_to_file():
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_ALL_MODS_CACHE, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"failed to write local cache file: {e}")
+
+def load_cache_from_file():
+    global _ALL_MODS_CACHE
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                _ALL_MODS_CACHE = json.load(f)
+            rebuild_fast_index()
+            log.info(f"loaded {len(_ALL_MODS_CACHE)} mods from local storage.")
+        except Exception as e:
+            log.warning(f"failed to parse local cache file: {e}")
+
+def rebuild_fast_index():
+    global _INDEX_MAP
+    new_map = {}
+    for m in _ALL_MODS_CACHE:
+        mod_id = m.get("id", "").lower()
+        name = m.get("name", "").lower()
+        
+        tokens = set(mod_id.split(".") + mod_id.split("-") + name.split(" "))
+        for token in tokens:
+            if not token: 
+                continue
+            for i in range(1, min(len(token) + 1, 9)):
+                prefix = token[:i]
+                if prefix not in new_map:
+                    new_map[prefix] = []
+                if len(new_map[prefix]) < 25:
+                    new_map[prefix].append(m)
+    _INDEX_MAP = new_map
+
+# --- cloudflare d1 tracker ---
 class D1Tracker:
     def __init__(self):
         self.base_url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/d1/database/{cf_db}/query"
@@ -126,7 +167,7 @@ class D1Tracker:
 
 tracker = D1Tracker()
 
-# --- HELPER FUNCTIONS ---
+# --- helper funcs ---
 def normalize_single_mod_response(data: Any) -> dict:
     if isinstance(data, dict):
         payload = data.get("payload", data)
@@ -201,14 +242,14 @@ def find_mod_url(d: dict, mod_id: str) -> str:
     return f"https://geode-sdk.org/mods/{mod_id}"
 
 def find_description(d: dict) -> str:
-    if not isinstance(d, dict): return "no description"
+    if not isinstance(d, dict): return "no description provided."
     candidates = [d.get("description"), d.get("summary")]
     versions = d.get("versions")
     if isinstance(versions, list) and versions and isinstance(versions[0], dict):
         candidates.extend([versions[0].get("description"), versions[0].get("summary")])
     for c in candidates:
         if isinstance(c, str) and c.strip(): return c.strip()
-    return "no description"
+    return "no description provided."
 
 def find_name(d: dict, mod_id: str) -> str:
     if not isinstance(d, dict): return mod_id
@@ -226,7 +267,7 @@ def format_error_reason(error: Any) -> str:
     text = str(error).strip() if error is not None else "unknown error"
     return " ".join(text.split())[:180] or "unknown error"
 
-# --- UI & EMBED BUILDERS ---
+# --- ui & embed builders ---
 class NotifyView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -284,32 +325,35 @@ def build_single_mod_embed(mod_data: dict) -> discord.Embed:
     tags = mod_data.get("tags", [])
     if tags: embed.add_field(name="tags", value=", ".join(tags), inline=False)
         
-    embed.set_footer(text="geode index")
+    embed.set_footer(text="geode index | run /invite to add me to your server!")
     return embed
 
 def build_list_embeds(title: str, mods: list, page: int, total_pages: int, per_page: int, total_mods: int) -> list[discord.Embed]:
-    title_embed = discord.Embed(title=title, color=0x5865F2)
-    title_embed.set_author(name=f"total mods: {total_mods:,}")
-    embeds = [title_embed]
+    embed = discord.Embed(title=title, color=0x5865F2, timestamp=datetime.now(timezone.utc))
+    embed.set_author(name=f"total mods: {total_mods:,}")
 
     if not mods:
-        title_embed.description = "*couldn't find any mods with that.*"
-        title_embed.set_footer(text=f"page {page}/{max(1, total_pages)}")
-        return embeds
+        embed.description = "*couldn't find any mods with that.*"
+        embed.set_footer(text=f"page {page}/{max(1, total_pages)}")
+        return [embed]
 
     start_idx = (page - 1) * per_page + 1
     for i, m in enumerate(mods, start_idx):
         mod_id = m.get("id") or "unknown.id"
         desc = find_description(m)
-        desc = desc[:82] + "..." if len(desc) > 85 else desc
+        desc = desc[:110] + "..." if len(desc) > 115 else desc
         
-        text = f"*{desc}*\n📦 `{mod_id}` • ⬇️ {find_downloads(m) or 0:,}"
-        embed = discord.Embed(description=text, color=0x5865F2)
-        embed.set_author(name=f"{i}. {find_name(m, mod_id)} (by {find_developer(m)})", icon_url=find_logo(mod_id), url=f"https://geode-sdk.org/mods/{mod_id}")
-        embeds.append(embed)
+        field_title = f"{i}. {find_name(m, mod_id)} — by {find_developer(m)}"
+        field_body = (
+            f"📦 **id:** `{mod_id}`\n"
+            f"⬇️ **downloads:** {find_downloads(m) or 0:,}\n"
+            f"📖 *{desc}*\n"
+            f"[view on geode](https://geode-sdk.org/mods/{mod_id})"
+        )
+        embed.add_field(name=field_title, value=field_body, inline=False)
 
-    embeds[-1].set_footer(text=f"page {page}/{max(1, total_pages)}")
-    return embeds
+    embed.set_footer(text=f"page {page}/{max(1, total_pages)} • run /invite to add me!")
+    return [embed]
 
 class ModSelect(discord.ui.Select):
     def __init__(self, mods: list):
@@ -349,13 +393,15 @@ class PageModal(discord.ui.Modal, title="jump to page"):
             await interaction.response.send_message("doesn't look like a valid number, give it another go.", ephemeral=True)
 
 class ModSearchView(discord.ui.View):
-    def __init__(self, bot, query: str = None, sort_mode: str = "downloads", per_page: int = 3):
+    def __init__(self, bot, query: str = None, sort_mode: str = "downloads", per_page: int = 3, platform: str = None, tag: str = None):
         super().__init__(timeout=None)
         self.bot = bot
         self.query = query
         self.sort_mode = sort_mode
         self.page = 1
         self.per_page = per_page
+        self.platform = platform
+        self.tag = tag
         self.total_pages = 1
         self.total_mods = 0
         self.mods = []
@@ -369,7 +415,9 @@ class ModSearchView(discord.ui.View):
             query=self.query, 
             sort=actual_sort, 
             status=status_val,
-            featured=featured, 
+            featured=featured,
+            platforms=self.platform,
+            tags=self.tag,
             page=self.page, 
             per_page=self.per_page
         )
@@ -400,6 +448,9 @@ class ModSearchView(discord.ui.View):
             "pending": "pending mods"
         }
         title = f"search: {self.query} ({titles.get(self.sort_mode, '')})" if self.query else titles.get(self.sort_mode, "trending mods")
+        if self.platform: title += f" | {self.platform}"
+        if self.tag: title += f" | tag: {self.tag}"
+        
         return build_list_embeds(title, self.mods, self.page, self.total_pages, self.per_page, self.total_mods)
 
     @discord.ui.button(label="<", style=discord.ButtonStyle.secondary, custom_id="prev")
@@ -416,7 +467,7 @@ class ModSearchView(discord.ui.View):
         self.page += 1
         await interaction.response.edit_message(embeds=await self.generate_view(), view=self)
 
-# --- BOT CLASS & SETUP ---
+# --- bot class & setup ---
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=discord.Intents.default())
@@ -425,6 +476,7 @@ class Bot(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
         self.add_view(NotifyView())
+        load_cache_from_file()
         await self.tree.sync()
         self.refresh_all_mods_cache.start()
         self.check_mod_updates.start()
@@ -464,8 +516,8 @@ class Bot(commands.Bot):
         except Exception as e:
             return {"error": format_error_reason(e)}
 
-    async def fetch_mods_list(self, query: str = None, developer: str = None, sort: str = "downloads", status: str = None, featured: bool = False, page: int = 1, per_page: int = 3) -> dict:
-        cache_key = f"list_{query}_{developer}_{sort}_{status}_{featured}_{page}_{per_page}"
+    async def fetch_mods_list(self, query: str = None, developer: str = None, sort: str = "downloads", status: str = None, featured: bool = False, platforms: str = None, tags: str = None, page: int = 1, per_page: int = 3) -> dict:
+        cache_key = f"list_{query}_{developer}_{sort}_{status}_{featured}_{platforms}_{tags}_{page}_{per_page}"
         cached = get_cached_response(cache_key)
         if cached: return cached
 
@@ -474,6 +526,8 @@ class Bot(commands.Bot):
         if developer: params["developer"] = developer
         if featured: params["featured"] = "true"
         if status: params["status"] = status
+        if platforms: params["platforms"] = platforms
+        if tags: params["tags"] = tags
 
         try:
             async with self.session.get("https://api.geode-sdk.org/v1/mods", params=params) as r:
@@ -486,8 +540,6 @@ class Bot(commands.Bot):
 
     @tasks.loop(minutes=30)
     async def refresh_all_mods_cache(self):
-        # Quietly paginates through the entire geode index every 30m
-        # Stores only tiny {"id": "...", "name": "..."} dicts to keep memory footprint at < 2MB total.
         if not self.session: return
         try:
             all_mods = []
@@ -500,7 +552,6 @@ class Bot(commands.Bot):
                 if not mods:
                     break
                 
-                # Extract only necessary fields to keep memory usage extremely low
                 for m in mods:
                     mod_id = m.get('id') or 'unknown'
                     name = find_name(m, mod_id)
@@ -510,14 +561,15 @@ class Bot(commands.Bot):
                     break
                     
                 page += 1
-                # Small sleep to absolutely guarantee we don't trip Geode rate limits while paginating
                 await asyncio.sleep(0.5) 
                 
             global _ALL_MODS_CACHE
             if all_mods:
                 _ALL_MODS_CACHE = all_mods
+                save_cache_to_file()
+                rebuild_fast_index()
         except Exception as e:
-            log.warning(f"failed to cache all mods: {e}")
+            log.warning(f"cache pipeline exception: {e}")
 
     @refresh_all_mods_cache.before_loop
     async def before_refresh_all(self):
@@ -534,7 +586,6 @@ class Bot(commands.Bot):
                 try:
                     if not data["users"]: continue
                         
-                    # bypass cache to make sure we actually detect the new version
                     mod_resp = await self.fetch_single_mod(mod_id, bypass_cache=True)
                     if "error" in mod_resp: continue
 
@@ -555,19 +606,16 @@ class Bot(commands.Bot):
                             except Exception as e:
                                 log.warning(f"couldn't send update to {uid}: {e}")
                             
-                            # Fast sleep to avoid spamming Discord API and hitting rate limits
                             await asyncio.sleep(0.2)
                         
-                        # UPDATE THE DB ONLY AFTER PROCESSING DMs to prevent offline skipping!
                         await tracker.update_version(self.session, mod_id, latest_v)
                 except Exception as e:
-                    log.error(f"Error processing mod {mod_id} updates: {e}")
+                    log.error(f"error processing mod {mod_id} updates: {e}")
         except Exception as e:
-            log.error(f"Error fetching tracking data: {e}")
+            log.error(f"error fetching tracking data: {e}")
 
     @check_mod_updates.before_loop
     async def before_check_mod_updates(self):
-        # Extremely important: Wait until bot is fully connected before scraping users or API
         await self.wait_until_ready()
 
 bot = Bot()
@@ -577,35 +625,43 @@ async def mod_autocomplete_logic(current: str):
         return []
         
     if not _ALL_MODS_CACHE:
-        # Fallback to API if cache is still building (happens only in the first 5 seconds of booting up)
         data = await bot.fetch_mods_list(query=current, sort="downloads", page=1, per_page=15)
         mods = data.get("data", [])
         return [discord.app_commands.Choice(name=f"{find_name(m, m.get('id') or 'unknown')} ({m.get('id') or 'unknown'})", value=m.get('id') or "unknown") for m in mods][:25]
     
     if not current:
-        # User hasn't typed anything yet: instantly return top 25 trending mods
-        return [discord.app_commands.Choice(name=f"{m['name']} ({m['id']})", value=m['id']) for m in _ALL_MODS_CACHE][:25]
+        return [discord.app_commands.Choice(name=f"{m['name']} ({m['id']})", value=m['id']) for m in _ALL_MODS_CACHE[:25]]
         
     current_lower = current.lower()
     
-    # Python filters this locally in less than 1 millisecond. No API calls needed. 100% Instant.
+    # fast o(1) lookup map for prefix matches
+    if current_lower in _INDEX_MAP:
+        local_matches = _INDEX_MAP[current_lower]
+        return [discord.app_commands.Choice(name=f"{m['name']} ({m['id']})", value=m['id']) for m in local_matches][:25]
+        
+    # fallback searching
     local_matches = [m for m in _ALL_MODS_CACHE if current_lower in m["id"].lower() or current_lower in m["name"].lower()]
-    
     return [discord.app_commands.Choice(name=f"{m['name']} ({m['id']})", value=m['id']) for m in local_matches][:25]
 
-# --- COMMANDS ---
+# --- commands ---
 
 @bot.tree.command(name="getindex", description="browse geode mods or search the index")
-@discord.app_commands.describe(mod_id="specific mod to view", search="search mod by name", sort_by="sort the mod list", per_page="mods per page (1-5)")
+@discord.app_commands.describe(mod_id="specific mod to view", search="search mod by name", sort_by="sort the mod list", platform="filter by platform", tag="filter by tag", per_page="mods per page (1-5)")
 @discord.app_commands.choices(sort_by=[
     discord.app_commands.Choice(name="featured", value="featured"),
     discord.app_commands.Choice(name="recently updated", value="recently_updated"),
     discord.app_commands.Choice(name="recent", value="recently_published"),
     discord.app_commands.Choice(name="pending", value="pending"),
 ])
-async def checkforupdates(interaction: discord.Interaction, mod_id: Optional[str] = None, search: Optional[str] = None, sort_by: Optional[discord.app_commands.Choice[str]] = None, per_page: discord.app_commands.Range[int, 1, 5] = 3):
-    if search or sort_by: mod_id = None
-    if (search and contains_banned_word(search)) or (mod_id and contains_banned_word(mod_id)):
+@discord.app_commands.choices(platform=[
+    discord.app_commands.Choice(name="windows", value="windows"),
+    discord.app_commands.Choice(name="mac", value="macos"),
+    discord.app_commands.Choice(name="android", value="android"),
+    discord.app_commands.Choice(name="ios", value="ios"),
+])
+async def checkforupdates(interaction: discord.Interaction, mod_id: Optional[str] = None, search: Optional[str] = None, sort_by: Optional[discord.app_commands.Choice[str]] = None, platform: Optional[discord.app_commands.Choice[str]] = None, tag: Optional[str] = None, per_page: discord.app_commands.Range[int, 1, 5] = 3):
+    if search or sort_by or platform or tag: mod_id = None
+    if (search and contains_banned_word(search)) or (mod_id and contains_banned_word(mod_id)) or (tag and contains_banned_word(tag)):
         return await interaction.response.send_message("let's keep the words clean, man.", ephemeral=True)
 
     await interaction.response.defer()
@@ -616,12 +672,31 @@ async def checkforupdates(interaction: discord.Interaction, mod_id: Optional[str
             return await interaction.followup.send(f"ah, {mod_data['error']}")
         await interaction.followup.send(embed=build_single_mod_embed(mod_data), view=NotifyView())
     else:
-        view = ModSearchView(bot, query=search, sort_mode=sort_by.value if sort_by else "downloads", per_page=per_page)
+        view = ModSearchView(
+            bot, 
+            query=search, 
+            sort_mode=sort_by.value if sort_by else "downloads", 
+            per_page=per_page,
+            platform=platform.value if platform else None,
+            tag=tag
+        )
         await interaction.followup.send(embeds=await view.generate_view(), view=view)
 
 @checkforupdates.autocomplete("mod_id")
 async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, current: str):
     return await mod_autocomplete_logic(current)
+
+@bot.tree.command(name="invite", description="add this bot to your own servers!")
+async def invite_cmd(interaction: discord.Interaction):
+    # dynamic client id pulling so it works instantly on your end
+    link = f"https://discord.com/oauth2/authorize?client_id={bot.user.id}&permissions=274877975552&scope=bot%20applications.commands"
+    embed = discord.Embed(
+        title="put me in your server!",
+        description=f"stop manually checking for geode mod updates like a caveman.\n\n[click here to invite me]({link}) and let me do the heavy lifting. your server needs this.",
+        color=0x5865F2
+    )
+    embed.set_footer(text="the best geode tracker on discord.")
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="untrack", description="stop getting dm notifications for a specific mod")
 @discord.app_commands.describe(mod_id="the id of the mod to stop tracking")
