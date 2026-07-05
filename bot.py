@@ -4,21 +4,20 @@ import os
 import re
 import random
 import string
+import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Dict, Tuple
 
 import aiohttp
 import discord
 from discord.ext import commands, tasks
 
 # --- ENV VARS ---
-# Using .strip() guarantees no accidental trailing spaces/newlines cause Auth 10000 errors.
 token = (os.getenv("DISCORD_TOKEN") or "").strip()
 cf_account = (os.getenv("CF_ACCOUNT_ID") or "").strip()
 cf_db = (os.getenv("CF_DATABASE_ID") or "").strip()
 cf_token = (os.getenv("CF_API_TOKEN") or "").strip()
 
-# Prevents "Bearer Bearer..." if your token in the .env already included the prefix
 if cf_token.lower().startswith("bearer "):
     cf_token = cf_token[7:].strip()
 
@@ -26,6 +25,22 @@ api_url = "https://api.geode-sdk.org/v1/mods/{}"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("geode")
+
+# --- LETS GOOO: 100X SPEED IN-MEMORY CACHE ---
+_API_CACHE: Dict[str, Tuple[float, Any]] = {}
+CACHE_TTL = 300  # Cache lasts 5 minutes, keeping it completely instant without disk saves!
+
+def get_cached_response(key: str):
+    if key in _API_CACHE:
+        timestamp, data = _API_CACHE[key]
+        if time.time() - timestamp < CACHE_TTL:
+            return data
+        else:
+            del _API_CACHE[key]
+    return None
+
+def set_cached_response(key: str, data: Any):
+    _API_CACHE[key] = (time.time(), data)
 
 # banned words filter
 BANNED_WORDS = [
@@ -71,7 +86,7 @@ class D1Tracker:
         
         results = res.get("result", [{}])[0].get("results", [])
         if results:
-            return False # already tracking
+            return False
 
         insert_sql = "INSERT INTO tracking (mod_id, version, user_id) VALUES (?, ?, ?)"
         await self.query(session, insert_sql, [mod_id, version, uid_str])
@@ -96,7 +111,6 @@ class D1Tracker:
         res = await self.query(session, sql)
         results = res.get("result", [{}])[0].get("results", [])
         
-        # group by mod_id to match old logic
         grouped = {}
         for row in results:
             m_id = row["mod_id"]
@@ -213,7 +227,6 @@ def format_error_reason(error: Any) -> str:
 
 # --- UI & EMBED BUILDERS ---
 class NotifyView(discord.ui.View):
-    # Setting timeout to None means this view won't expire randomly while the bot runs
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -336,7 +349,6 @@ class PageModal(discord.ui.Modal, title="jump to page"):
 
 class ModSearchView(discord.ui.View):
     def __init__(self, bot, query: str = None, sort_mode: str = "downloads", per_page: int = 3):
-        # Setting timeout to None prevents the view from ever timing out natively and breaking
         super().__init__(timeout=None)
         self.bot = bot
         self.query = query
@@ -349,12 +361,7 @@ class ModSearchView(discord.ui.View):
 
     async def load_data(self):
         featured = (self.sort_mode == "featured")
-        
-        # If pending, we ask the API specifically for pending mods
         status_val = "pending" if self.sort_mode == "pending" else None
-        
-        # We need an actual sorting method if "pending" is the selection 
-        # (recently_updated makes sense for finding new pending mods)
         actual_sort = "recently_updated" if self.sort_mode == "pending" else ("downloads" if featured else self.sort_mode)
         
         data = await self.bot.fetch_mods_list(
@@ -439,17 +446,27 @@ class Bot(commands.Bot):
         if self.session: await self.session.close()
         await super().close()
 
-    async def fetch_single_mod(self, mod_id: str) -> dict:
+    async def fetch_single_mod(self, mod_id: str, bypass_cache: bool = False) -> dict:
+        cache_key = f"mod_{mod_id}"
+        if not bypass_cache:
+            cached = get_cached_response(cache_key)
+            if cached: return cached
+
         try:
             async with self.session.get(api_url.format(mod_id)) as r:
                 if r.status == 404: return {"error": "mod not found"}
                 r.raise_for_status()
-                return normalize_single_mod_response(await r.json())
+                data = normalize_single_mod_response(await r.json())
+                set_cached_response(cache_key, data)
+                return data
         except Exception as e:
             return {"error": format_error_reason(e)}
 
-    # Added 'status' kwarg so we can pull from the pending list natively
     async def fetch_mods_list(self, query: str = None, developer: str = None, sort: str = "downloads", status: str = None, featured: bool = False, page: int = 1, per_page: int = 3) -> dict:
+        cache_key = f"list_{query}_{developer}_{sort}_{status}_{featured}_{page}_{per_page}"
+        cached = get_cached_response(cache_key)
+        if cached: return cached
+
         params = {"page": page, "per_page": per_page, "sort": sort}
         if query: params["query"] = query
         if developer: params["developer"] = developer
@@ -458,7 +475,10 @@ class Bot(commands.Bot):
 
         try:
             async with self.session.get("https://api.geode-sdk.org/v1/mods", params=params) as r:
-                return normalize_list_response(await r.json()) if r.status == 200 else {"count": 0, "data": []}
+                data = normalize_list_response(await r.json()) if r.status == 200 else {"count": 0, "data": []}
+                if r.status == 200:
+                    set_cached_response(cache_key, data)
+                return data
         except Exception:
             return {"count": 0, "data": []}
 
@@ -466,13 +486,13 @@ class Bot(commands.Bot):
     async def check_mod_updates(self):
         if not self.session: return
         
-        # Pull all tracking records from D1
         tracking_data = await tracker.get_all_tracking(self.session)
         
         for mod_id, data in tracking_data.items():
             if not data["users"]: continue
                 
-            mod_resp = await self.fetch_single_mod(mod_id)
+            # bypass cache to make sure we actually detect the new version
+            mod_resp = await self.fetch_single_mod(mod_id, bypass_cache=True)
             if "error" in mod_resp: continue
 
             latest_v = find_version(mod_resp) or data["version"]
@@ -487,10 +507,11 @@ class Bot(commands.Bot):
                         if user:
                             await user.send(f"🔔 **update alert!**\n**{find_name(mod_resp, mod_id)}** just updated to **{latest_v}**!", embed=embed, view=NotifyView())
                     except discord.Forbidden:
-                        pass # DMs closed, ugh
+                        pass
                     except Exception as e:
                         log.warning(f"couldn't send update to {uid}: {e}")
-                    await asyncio.sleep(0.5)
+                    # Fast sleep to avoid spamming Discord API
+                    await asyncio.sleep(0.1)
 
 bot = Bot()
 
