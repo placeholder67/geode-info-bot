@@ -330,12 +330,11 @@ class PageModal(discord.ui.Modal, title="Jump to Page"):
             await interaction.response.send_message("invalid page number.", ephemeral=True)
 
 class ModSearchView(discord.ui.View):
-    def __init__(self, bot, query: str = None, developer: str = None, is_trending: bool = False, per_page: int = 3):
+    def __init__(self, bot, query: str = None, sort_mode: str = "downloads", per_page: int = 3):
         super().__init__(timeout=300)
         self.bot = bot
         self.query = query
-        self.developer = developer
-        self.is_trending = is_trending
+        self.sort_mode = sort_mode
         self.page = 1
         self.per_page = per_page
         self.total_pages = 1
@@ -343,7 +342,9 @@ class ModSearchView(discord.ui.View):
         self.mods = []
 
     async def load_data(self):
-        data = await self.bot.fetch_mods_list(query=self.query, developer=self.developer, sort="downloads", page=self.page, per_page=self.per_page)
+        featured = (self.sort_mode == "featured")
+        sort_val = "downloads" if featured else self.sort_mode
+        data = await self.bot.fetch_mods_list(query=self.query, sort=sort_val, featured=featured, page=self.page, per_page=self.per_page)
         self.mods = data.get("data", [])
         self.total_mods = data.get("count", 0)
         self.total_pages = max(1, (self.total_mods + self.per_page - 1) // self.per_page)
@@ -366,12 +367,20 @@ class ModSearchView(discord.ui.View):
         await self.load_data()
         self.update_items()
         
-        if self.developer and self.query:
-            title = f"search: {self.query} (by {self.developer})"
-        elif self.developer:
-            title = f"mods by {self.developer}"
-        elif self.query:
+        if self.query:
             title = f"search: {self.query}"
+            if self.sort_mode == "featured":
+                title += " (featured)"
+            elif self.sort_mode == "recently_updated":
+                title += " (recently updated)"
+            elif self.sort_mode == "recently_published":
+                title += " (THE RECENT TAB!)"
+        elif self.sort_mode == "featured":
+            title = "featured mods"
+        elif self.sort_mode == "recently_updated":
+            title = "recently updated mods"
+        elif self.sort_mode == "recently_published":
+            title = "THE RECENT TAB!"
         else:
             title = "trending mods"
             
@@ -445,7 +454,7 @@ class Bot(commands.Bot):
         except Exception as e:
             return {"error": format_error_reason(e)}
 
-    async def fetch_mods_list(self, query: str = None, developer: str = None, sort: str = "downloads", page: int = 1, per_page: int = 3) -> dict:
+    async def fetch_mods_list(self, query: str = None, developer: str = None, sort: str = "downloads", featured: bool = False, page: int = 1, per_page: int = 3) -> dict:
         url = "https://api.geode-sdk.org/v1/mods"
         params = {"page": page, "per_page": per_page}
         if query:
@@ -454,6 +463,8 @@ class Bot(commands.Bot):
             params["developer"] = developer
         if sort:
             params["sort"] = sort
+        if featured:
+            params["featured"] = "true"
 
         try:
             async with self.session.get(url, params=params) as r:
@@ -483,27 +494,32 @@ async def mod_autocomplete_logic(current: str):
 
 # geode commands
 
-@bot.tree.command(name="getindex", description="browse trending geode mods or search the index")
+@bot.tree.command(name="getindex", description="browse geode mods or search the index")
 @discord.app_commands.describe(
     mod_id="specific mod to view (autocompletes from api)",
     search="search mod by name",
-    developer="filter by developer name",
+    sort_by="sort the mod list (trending, featured, recently updated, recent)",
     per_page="how many mods to show per page (1-5, default 3)"
 )
+@discord.app_commands.choices(sort_by=[
+    discord.app_commands.Choice(name="trending", value="downloads"),
+    discord.app_commands.Choice(name="featured", value="featured"),
+    discord.app_commands.Choice(name="recently updated", value="recently_updated"),
+    discord.app_commands.Choice(name="recent", value="recently_published"),
+])
 async def checkforupdates(
     interaction: discord.Interaction,
     mod_id: Optional[str] = None,
     search: Optional[str] = None,
-    developer: Optional[str] = None,
+    sort_by: Optional[discord.app_commands.Choice[str]] = None,
     per_page: discord.app_commands.Range[int, 1, 5] = 3,
 ):
-    # ignore uncorrelated options (if they are trying to search or filter by dev, ignore mod_id)
-    if search or developer:
+    # ignore uncorrelated options
+    if search or sort_by:
         mod_id = None
 
     if (search and contains_banned_word(search)) or \
-       (mod_id and contains_banned_word(mod_id)) or \
-       (developer and contains_banned_word(developer)):
+       (mod_id and contains_banned_word(mod_id)):
         return await interaction.response.send_message("blocked: contains banned words.", ephemeral=True)
 
     await interaction.response.defer()
@@ -516,13 +532,9 @@ async def checkforupdates(
         embed = build_single_mod_embed(mod_data)
         await interaction.followup.send(embed=embed)
         
-    elif search or developer:
-        view = ModSearchView(bot, query=search, developer=developer, is_trending=False, per_page=per_page)
-        embeds = await view.generate_view()
-        await interaction.followup.send(embeds=embeds, view=view)
-        
     else:
-        view = ModSearchView(bot, query=None, developer=None, is_trending=True, per_page=per_page)
+        sort_val = sort_by.value if sort_by else "downloads"
+        view = ModSearchView(bot, query=search, sort_mode=sort_val, per_page=per_page)
         embeds = await view.generate_view()
         await interaction.followup.send(embeds=embeds, view=view)
 
