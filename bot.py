@@ -213,6 +213,7 @@ def format_error_reason(error: Any) -> str:
 
 # --- UI & EMBED BUILDERS ---
 class NotifyView(discord.ui.View):
+    # Setting timeout to None means this view won't expire randomly while the bot runs
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -232,16 +233,16 @@ class NotifyView(discord.ui.View):
             if m: version = m.group(1)
 
         if not mod_id:
-            return await interaction.response.send_message("hmm, couldn't find the mod id on this one.", ephemeral=True)
+            return await interaction.response.send_message("couldn't track down the mod id on this one, my bad.", ephemeral=True)
 
         added = await tracker.add_tracking(interaction.client.session, mod_id, version, interaction.user.id)
         if added:
             await interaction.response.send_message(
-                f"🔔 **all set!** i'll dm you when `{mod_id}` updates.\n*(use `/untrack {mod_id}` in my dms if you change your mind)*", 
+                f"🔔 **got it.** i'll slide into your dms when `{mod_id}` updates.\n*(just use `/untrack {mod_id}` in my dms if you want me to stop)*", 
                 ephemeral=True
             )
         else:
-            await interaction.response.send_message("you're already tracking this one, all good!", ephemeral=True)
+            await interaction.response.send_message("you're already tracking this one, you're good.", ephemeral=True)
 
 def build_single_mod_embed(mod_data: dict) -> discord.Embed:
     mod_id = mod_data.get("id") or "unknown.id"
@@ -278,7 +279,7 @@ def build_list_embeds(title: str, mods: list, page: int, total_pages: int, per_p
     embeds = [title_embed]
 
     if not mods:
-        title_embed.description = "*couldn't find any mods.*"
+        title_embed.description = "*couldn't find any mods with that.*"
         title_embed.set_footer(text=f"page {page}/{max(1, total_pages)}")
         return embeds
 
@@ -314,7 +315,7 @@ class ModSelect(discord.ui.Select):
         mod_data = await interaction.client.fetch_single_mod(self.values[0])
         
         if "error" in mod_data:
-            return await interaction.followup.send(f"yikes, error fetching mod: {mod_data['error']}", ephemeral=True)
+            return await interaction.followup.send(f"ah man, ran into an issue fetching that mod: {mod_data['error']}", ephemeral=True)
             
         await interaction.followup.send(embed=build_single_mod_embed(mod_data), view=NotifyView(), ephemeral=True)
 
@@ -331,11 +332,12 @@ class PageModal(discord.ui.Modal, title="jump to page"):
             self.view.page = new_page
             await interaction.response.edit_message(embeds=await self.view.generate_view(), view=self.view)
         except ValueError:
-            await interaction.response.send_message("that doesn't look like a number, try again.", ephemeral=True)
+            await interaction.response.send_message("doesn't look like a valid number, give it another go.", ephemeral=True)
 
 class ModSearchView(discord.ui.View):
     def __init__(self, bot, query: str = None, sort_mode: str = "downloads", per_page: int = 3):
-        super().__init__(timeout=300)
+        # Setting timeout to None prevents the view from ever timing out natively and breaking
+        super().__init__(timeout=None)
         self.bot = bot
         self.query = query
         self.sort_mode = sort_mode
@@ -347,7 +349,22 @@ class ModSearchView(discord.ui.View):
 
     async def load_data(self):
         featured = (self.sort_mode == "featured")
-        data = await self.bot.fetch_mods_list(query=self.query, sort="downloads" if featured else self.sort_mode, featured=featured, page=self.page, per_page=self.per_page)
+        
+        # If pending, we ask the API specifically for pending mods
+        status_val = "pending" if self.sort_mode == "pending" else None
+        
+        # We need an actual sorting method if "pending" is the selection 
+        # (recently_updated makes sense for finding new pending mods)
+        actual_sort = "recently_updated" if self.sort_mode == "pending" else ("downloads" if featured else self.sort_mode)
+        
+        data = await self.bot.fetch_mods_list(
+            query=self.query, 
+            sort=actual_sort, 
+            status=status_val,
+            featured=featured, 
+            page=self.page, 
+            per_page=self.per_page
+        )
         self.mods = data.get("data", [])
         self.total_mods = data.get("count", 0)
         self.total_pages = max(1, (self.total_mods + self.per_page - 1) // self.per_page)
@@ -371,7 +388,8 @@ class ModSearchView(discord.ui.View):
             "featured": "featured mods",
             "recently_updated": "recently updated mods",
             "recently_published": "the recent tab!",
-            "downloads": "trending mods"
+            "downloads": "trending mods",
+            "pending": "pending mods"
         }
         title = f"search: {self.query} ({titles.get(self.sort_mode, '')})" if self.query else titles.get(self.sort_mode, "trending mods")
         return build_list_embeds(title, self.mods, self.page, self.total_pages, self.per_page, self.total_mods)
@@ -401,7 +419,7 @@ class Bot(commands.Bot):
         self.add_view(NotifyView())
         await self.tree.sync()
         self.check_mod_updates.start()
-        log.info("bot is up, slash commands synced.")
+        log.info("bot is online and commands are synced, ready to roll.")
 
     async def update_presence(self):
         total_members = sum(guild.member_count or 0 for guild in self.guilds)
@@ -412,7 +430,7 @@ class Bot(commands.Bot):
 
     async def on_ready(self):
         await self.update_presence()
-        log.info(f"bro is {self.user}")
+        log.info(f"we are logged in as {self.user}, let's go.")
 
     async def on_guild_join(self, guild): await self.update_presence()
     async def on_guild_remove(self, guild): await self.update_presence()
@@ -430,11 +448,13 @@ class Bot(commands.Bot):
         except Exception as e:
             return {"error": format_error_reason(e)}
 
-    async def fetch_mods_list(self, query: str = None, developer: str = None, sort: str = "downloads", featured: bool = False, page: int = 1, per_page: int = 3) -> dict:
+    # Added 'status' kwarg so we can pull from the pending list natively
+    async def fetch_mods_list(self, query: str = None, developer: str = None, sort: str = "downloads", status: str = None, featured: bool = False, page: int = 1, per_page: int = 3) -> dict:
         params = {"page": page, "per_page": per_page, "sort": sort}
         if query: params["query"] = query
         if developer: params["developer"] = developer
         if featured: params["featured"] = "true"
+        if status: params["status"] = status
 
         try:
             async with self.session.get("https://api.geode-sdk.org/v1/mods", params=params) as r:
@@ -487,18 +507,19 @@ async def mod_autocomplete_logic(current: str):
     discord.app_commands.Choice(name="featured", value="featured"),
     discord.app_commands.Choice(name="recently updated", value="recently_updated"),
     discord.app_commands.Choice(name="recent", value="recently_published"),
+    discord.app_commands.Choice(name="pending", value="pending"),
 ])
 async def checkforupdates(interaction: discord.Interaction, mod_id: Optional[str] = None, search: Optional[str] = None, sort_by: Optional[discord.app_commands.Choice[str]] = None, per_page: discord.app_commands.Range[int, 1, 5] = 3):
     if search or sort_by: mod_id = None
     if (search and contains_banned_word(search)) or (mod_id and contains_banned_word(mod_id)):
-        return await interaction.response.send_message("hey, let's keep it clean. banned word detected.", ephemeral=True)
+        return await interaction.response.send_message("let's keep the words clean, man.", ephemeral=True)
 
     await interaction.response.defer()
 
     if mod_id:
         mod_data = await bot.fetch_single_mod(mod_id)
         if "error" in mod_data:
-            return await interaction.followup.send(f"hmm, {mod_data['error']}")
+            return await interaction.followup.send(f"ah, {mod_data['error']}")
         await interaction.followup.send(embed=build_single_mod_embed(mod_data), view=NotifyView())
     else:
         view = ModSearchView(bot, query=search, sort_mode=sort_by.value if sort_by else "downloads", per_page=per_page)
@@ -512,13 +533,13 @@ async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, cur
 @discord.app_commands.describe(mod_id="the id of the mod to stop tracking")
 async def untrack_cmd(interaction: discord.Interaction, mod_id: str):
     if interaction.guild is not None:
-        return await interaction.response.send_message("❌ slide into my dms to use this command, keeps things private!", ephemeral=True)
+        return await interaction.response.send_message("❌ hop into my dms to use this, keeps it between us.", ephemeral=True)
 
     removed = await tracker.remove_tracking(bot.session, mod_id, interaction.user.id)
     if removed:
-        await interaction.response.send_message(f"✅ all good, you won't hear about `{mod_id}` anymore.", ephemeral=True)
+        await interaction.response.send_message(f"✅ done deal, i won't bother you about `{mod_id}` anymore.", ephemeral=True)
     else:
-        await interaction.response.send_message(f"⚠️ you aren't actually tracking `{mod_id}` right now.", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ doesn't look like you're tracking `{mod_id}` anyway.", ephemeral=True)
 
 @untrack_cmd.autocomplete("mod_id")
 async def untrack_autocomplete(interaction: discord.Interaction, current: str):
@@ -528,11 +549,11 @@ async def untrack_autocomplete(interaction: discord.Interaction, current: str):
 @bot.tree.command(name="tracked", description="view all mods you are tracking")
 async def tracked_cmd(interaction: discord.Interaction):
     if interaction.guild is not None:
-        return await interaction.response.send_message("❌ jump into my dms to use this!", ephemeral=True)
+        return await interaction.response.send_message("❌ hop into my dms for this one!", ephemeral=True)
 
     user_tracked = await tracker.get_user_tracked_mods(bot.session, interaction.user.id)
     if not user_tracked:
-        return await interaction.response.send_message("you aren't tracking anything yet. run `/getindex` in a server and click 'notify me!' to start.", ephemeral=True)
+        return await interaction.response.send_message("you aren't tracking anything yet. just run `/getindex` in a server and hit 'notify me!' to start.", ephemeral=True)
 
     mod_list = "\n".join([f"• `{m}`" for m in user_tracked])
     await interaction.response.send_message(embed=discord.Embed(
@@ -544,16 +565,16 @@ async def tracked_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="erymanthus", description="check if your mod idea exists already")
 async def erymanthus(interaction: discord.Interaction, search: str, max_results: discord.app_commands.Range[int, 1, 5] = 3):
     if contains_banned_word(search):
-        return await interaction.response.send_message("nope, let's keep it clean.", ephemeral=True)
+        return await interaction.response.send_message("nah, let's keep the language clean.", ephemeral=True)
 
     await interaction.response.defer()
     data = await bot.fetch_mods_list(query=search, sort="downloads", page=1, per_page=max_results)
     mods = data.get("data", [])
 
     if not mods:
-        embed = discord.Embed(title="idea check: clear", description=f"nothing found for **{search}**. you're good to go!", color=0x2ecc71)
+        embed = discord.Embed(title="idea check: you're clear", description=f"didn't find anything for **{search}**. you're good to start cooking!", color=0x2ecc71)
     else:
-        embed = discord.Embed(title="idea check: similar stuff found", description=f"take a look at these first:\n\n", color=0xe67e22)
+        embed = discord.Embed(title="idea check: found some similar stuff", description=f"you might want to peek at these first:\n\n", color=0xe67e22)
         for m in mods:
             mod_id, desc = m.get("id") or "unknown.id", find_description(m)
             embed.description += f"**[{find_name(m, mod_id)}](https://geode-sdk.org/mods/{mod_id})** (`{mod_id}`)\n> {desc[:82] + '...' if len(desc)>85 else desc}\n\n"
@@ -570,10 +591,10 @@ async def erymanthus(interaction: discord.Interaction, search: str, max_results:
 async def dev(interaction: discord.Interaction, command: discord.app_commands.Choice[str], mod_id: Optional[str] = None):
     cmd = command.value
     if cmd != "repo": mod_id = None
-    if mod_id and contains_banned_word(mod_id): return await interaction.response.send_message("clean language only, please.", ephemeral=True)
+    if mod_id and contains_banned_word(mod_id): return await interaction.response.send_message("let's keep it clean, please.", ephemeral=True)
 
     if cmd == "repo":
-        if not mod_id: return await interaction.response.send_message("you need to give me a `mod_id` for that.", ephemeral=True)
+        if not mod_id: return await interaction.response.send_message("gonna need a `mod_id` for that to work.", ephemeral=True)
         await interaction.response.defer()
         try:
             async with bot.session.get(api_url.format(mod_id)) as r:
@@ -583,11 +604,11 @@ async def dev(interaction: discord.Interaction, command: discord.app_commands.Ch
                     src = links.get("source") or links.get("repository") or mod_obj.get("repository") or mod_obj.get("source")
                     await interaction.followup.send(f"**source for `{mod_id}`:**\n{src}" if src else f"couldn't find a repo link for `{mod_id}`.")
                 elif r.status == 404:
-                    await interaction.followup.send(f"mod `{mod_id}` doesn't seem to exist.")
+                    await interaction.followup.send(f"doesn't look like mod `{mod_id}` exists.")
                 else:
-                    await interaction.followup.send(f"api is acting up: http {r.status}")
+                    await interaction.followup.send(f"api is being a bit weird right now: http {r.status}")
         except Exception as e:
-            await interaction.followup.send(f"error grabbing repo: {format_error_reason(e)}")
+            await interaction.followup.send(f"ran into a snag grabbing the repo: {format_error_reason(e)}")
 
     elif cmd == "ery_string_generator":
         magic = f"ERYMANTHUS_MAGIC_STRING_TRIGGER_ACCEPT_MY_MOD_{''.join(random.choices(string.ascii_uppercase + string.digits, k=64))}"
