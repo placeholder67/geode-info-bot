@@ -26,4 +26,7 @@ jobs:
       - name: run bot
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_DATABASE_ID: ${{ secrets.CF_DATABASE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: python bot.py
