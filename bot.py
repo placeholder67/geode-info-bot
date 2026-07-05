@@ -30,6 +30,12 @@ _API_CACHE: Dict[str, Tuple[float, Any]] = {}
 CACHE_TTL = 300  
 
 _ALL_MODS_CACHE: List[dict] = []
+_TAGS_CACHE: List[str] = [
+    "universal", "gameplay", "editor", "offline", "online", 
+    "enhancement", "music", "interface", "bugfix", "utility", 
+    "performance", "customization", "content", "developer", 
+    "cheat", "paid", "joke"
+]
 
 def get_cached_response(key: str):
     if key in _API_CACHE:
@@ -530,6 +536,29 @@ class Bot(commands.Bot):
     async def refresh_all_mods_cache(self):
         if not self.session: return
         try:
+            # refresh tags first directly from geode api
+            try:
+                async with self.session.get("https://api.geode-sdk.org/v1/tags") as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        tags_list = []
+                        if isinstance(data, dict):
+                            payload = data.get("payload", data.get("data", data))
+                            if isinstance(payload, list): tags_list = payload
+                        elif isinstance(data, list):
+                            tags_list = data
+                        
+                        if tags_list:
+                            global _TAGS_CACHE
+                            new_tags = []
+                            for t in tags_list:
+                                if isinstance(t, str): new_tags.append(t)
+                                elif isinstance(t, dict) and "name" in t: new_tags.append(str(t["name"]))
+                            if new_tags:
+                                _TAGS_CACHE = new_tags
+            except Exception as e:
+                log.warning(f"couldn't update tags cache: {e}")
+
             all_mods = []
             page = 1
             per_page = 100
@@ -554,7 +583,7 @@ class Bot(commands.Bot):
             global _ALL_MODS_CACHE
             if all_mods:
                 _ALL_MODS_CACHE = all_mods
-                log.info(f"refreshed in-memory cache with {len(_ALL_MODS_CACHE)} mods.")
+                log.info(f"refreshed in-memory cache with {len(_ALL_MODS_CACHE)} mods and updated tags.")
         except Exception as e:
             log.warning(f"cache pipeline exception: {e}")
 
@@ -632,22 +661,31 @@ async def mod_autocomplete_logic(current: str):
 # --- commands ---
 
 @bot.tree.command(name="getindex", description="browse geode mods or search the index")
-@discord.app_commands.describe(mod_id="specific mod to view", search="search mod by name", sort_by="sort the mod list", platform="filter by platform", tag="filter by tag", per_page="mods per page (1-5)")
+@discord.app_commands.describe(
+    mod_id="specific mod to view", 
+    search="search mod by name", 
+    sort_by="sort the mod list", 
+    tags="filter by tag", 
+    platform="filter by platform", 
+    per_page="mods per page (1-5)"
+)
 @discord.app_commands.choices(sort_by=[
     discord.app_commands.Choice(name="featured", value="featured"),
     discord.app_commands.Choice(name="recently updated", value="recently_updated"),
     discord.app_commands.Choice(name="recent", value="recently_published"),
     discord.app_commands.Choice(name="pending", value="pending"),
 ])
-@discord.app_commands.choices(platform=[
-    discord.app_commands.Choice(name="windows", value="windows"),
-    discord.app_commands.Choice(name="mac", value="macos"),
-    discord.app_commands.Choice(name="android", value="android"),
-    discord.app_commands.Choice(name="ios", value="ios"),
-])
-async def checkforupdates(interaction: discord.Interaction, mod_id: Optional[str] = None, search: Optional[str] = None, sort_by: Optional[discord.app_commands.Choice[str]] = None, platform: Optional[discord.app_commands.Choice[str]] = None, tag: Optional[str] = None, per_page: discord.app_commands.Range[int, 1, 5] = 3):
-    if search or sort_by or platform or tag: mod_id = None
-    if (search and contains_banned_word(search)) or (mod_id and contains_banned_word(mod_id)) or (tag and contains_banned_word(tag)):
+async def checkforupdates(
+    interaction: discord.Interaction, 
+    mod_id: Optional[str] = None, 
+    search: Optional[str] = None, 
+    sort_by: Optional[discord.app_commands.Choice[str]] = None, 
+    tags: Optional[str] = None, 
+    platform: Optional[str] = None, 
+    per_page: discord.app_commands.Range[int, 1, 5] = 3
+):
+    if search or sort_by or platform or tags: mod_id = None
+    if (search and contains_banned_word(search)) or (mod_id and contains_banned_word(mod_id)) or (tags and contains_banned_word(tags)):
         return await interaction.response.send_message("let's keep the words clean, man.", ephemeral=True)
 
     await interaction.response.defer()
@@ -667,14 +705,36 @@ async def checkforupdates(interaction: discord.Interaction, mod_id: Optional[str
             query=search, 
             sort_mode=sort_by.value if sort_by else "downloads", 
             per_page=per_page,
-            platform=platform.value if platform else None,
-            tag=tag
+            platform=platform,
+            tag=tags
         )
         await interaction.followup.send(embeds=await view.generate_view(), view=view)
 
 @checkforupdates.autocomplete("mod_id")
 async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, current: str):
     return await mod_autocomplete_logic(current)
+
+@checkforupdates.autocomplete("tags")
+async def checkforupdates_tags_autocomplete(interaction: discord.Interaction, current: str):
+    matches = [t for t in _TAGS_CACHE if current.lower() in t.lower()][:25]
+    return [discord.app_commands.Choice(name=t, value=t) for t in matches]
+
+@checkforupdates.autocomplete("platform")
+async def checkforupdates_platform_autocomplete(interaction: discord.Interaction, current: str):
+    platforms_map = {
+        "windows": "windows",
+        "mac": "macos",
+        "android": "android",
+        "ios": "ios",
+        "android32": "android32",
+        "android64": "android64"
+    }
+    matches = [
+        discord.app_commands.Choice(name=name, value=val)
+        for name, val in platforms_map.items()
+        if current.lower() in name.lower() or current.lower() in val.lower()
+    ][:25]
+    return matches
 
 @bot.tree.command(name="invite", description="add this bot to your own servers!")
 async def invite_cmd(interaction: discord.Interaction):
