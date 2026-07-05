@@ -12,10 +12,15 @@ import discord
 from discord.ext import commands, tasks
 
 # --- ENV VARS ---
-token = os.getenv("DISCORD_TOKEN")
-cf_account = os.getenv("CF_ACCOUNT_ID")
-cf_db = os.getenv("CF_DATABASE_ID")
-cf_token = os.getenv("CF_API_TOKEN")
+# Using .strip() guarantees no accidental trailing spaces/newlines cause Auth 10000 errors.
+token = (os.getenv("DISCORD_TOKEN") or "").strip()
+cf_account = (os.getenv("CF_ACCOUNT_ID") or "").strip()
+cf_db = (os.getenv("CF_DATABASE_ID") or "").strip()
+cf_token = (os.getenv("CF_API_TOKEN") or "").strip()
+
+# Prevents "Bearer Bearer..." if your token in the .env already included the prefix
+if cf_token.lower().startswith("bearer "):
+    cf_token = cf_token[7:].strip()
 
 api_url = "https://api.geode-sdk.org/v1/mods/{}"
 
@@ -402,7 +407,7 @@ class Bot(commands.Bot):
         total_members = sum(guild.member_count or 0 for guild in self.guilds)
         await self.change_presence(activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name=f"the geode index <3 | {len(self.guilds):,} servers"
+            name=f"the geode index <3 | {len(self.guilds):,} servers | {total_members:,} members"
         ))
 
     async def on_ready(self):
