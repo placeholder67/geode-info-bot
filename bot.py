@@ -5,7 +5,6 @@ import re
 import random
 import string
 import time
-import json
 from datetime import datetime, timezone
 from typing import Any, Optional, Dict, Tuple, List
 
@@ -23,7 +22,6 @@ if cf_token.lower().startswith("bearer "):
     cf_token = cf_token[7:].strip()
 
 api_url = "https://api.geode-sdk.org/v1/mods/{}"
-CACHE_FILE = "geode_cache.json"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("geode")
@@ -32,7 +30,6 @@ _API_CACHE: Dict[str, Tuple[float, Any]] = {}
 CACHE_TTL = 300  
 
 _ALL_MODS_CACHE: List[dict] = []
-_INDEX_MAP: Dict[str, List[dict]] = {}
 
 def get_cached_response(key: str):
     if key in _API_CACHE:
@@ -60,44 +57,6 @@ def contains_banned_word(text: str) -> bool:
         if re.search(rf"\b{re.escape(banned)}\b", text_lower):
             return True
     return False
-
-# --- local file storage ---
-def save_cache_to_file():
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_ALL_MODS_CACHE, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.warning(f"failed to write local cache file: {e}")
-
-def load_cache_from_file():
-    global _ALL_MODS_CACHE
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                _ALL_MODS_CACHE = json.load(f)
-            rebuild_fast_index()
-            log.info(f"loaded {len(_ALL_MODS_CACHE)} mods from local storage.")
-        except Exception as e:
-            log.warning(f"failed to parse local cache file: {e}")
-
-def rebuild_fast_index():
-    global _INDEX_MAP
-    new_map = {}
-    for m in _ALL_MODS_CACHE:
-        mod_id = m.get("id", "").lower()
-        name = m.get("name", "").lower()
-        
-        tokens = set(mod_id.split(".") + mod_id.split("-") + name.split(" "))
-        for token in tokens:
-            if not token: 
-                continue
-            for i in range(1, min(len(token) + 1, 9)):
-                prefix = token[:i]
-                if prefix not in new_map:
-                    new_map[prefix] = []
-                if len(new_map[prefix]) < 25:
-                    new_map[prefix].append(m)
-    _INDEX_MAP = new_map
 
 # --- cloudflare d1 tracker ---
 class D1Tracker:
@@ -299,7 +258,7 @@ class NotifyView(discord.ui.View):
         else:
             await interaction.response.send_message("you're already tracking this one, you're good.", ephemeral=True)
 
-def build_single_mod_embed(mod_data: dict) -> discord.Embed:
+def build_single_mod_embed(mod_data: dict, ms_time: float, show_invite: bool) -> discord.Embed:
     mod_id = mod_data.get("id") or "unknown.id"
     name = find_name(mod_data, mod_id)
     dev = find_developer(mod_data)
@@ -325,16 +284,24 @@ def build_single_mod_embed(mod_data: dict) -> discord.Embed:
     tags = mod_data.get("tags", [])
     if tags: embed.add_field(name="tags", value=", ".join(tags), inline=False)
         
-    embed.set_footer(text="geode index | run /invite to add me to your server!")
+    footer_text = f"geode index | ⏱️ {ms_time:.1f}ms"
+    if show_invite:
+        footer_text += " | run /invite to add me to your server!"
+    
+    embed.set_footer(text=footer_text)
     return embed
 
-def build_list_embeds(title: str, mods: list, page: int, total_pages: int, per_page: int, total_mods: int) -> list[discord.Embed]:
+def build_list_embeds(title: str, mods: list, page: int, total_pages: int, per_page: int, total_mods: int, ms_time: float, show_invite: bool) -> list[discord.Embed]:
     embed = discord.Embed(title=title, color=0x5865F2, timestamp=datetime.now(timezone.utc))
     embed.set_author(name=f"total mods: {total_mods:,}")
 
+    footer_text = f"page {page}/{max(1, total_pages)} • ⏱️ {ms_time:.1f}ms"
+    if show_invite:
+        footer_text += " • run /invite to add me!"
+
     if not mods:
         embed.description = "*couldn't find any mods with that.*"
-        embed.set_footer(text=f"page {page}/{max(1, total_pages)}")
+        embed.set_footer(text=footer_text)
         return [embed]
 
     start_idx = (page - 1) * per_page + 1
@@ -352,7 +319,7 @@ def build_list_embeds(title: str, mods: list, page: int, total_pages: int, per_p
         )
         embed.add_field(name=field_title, value=field_body, inline=False)
 
-    embed.set_footer(text=f"page {page}/{max(1, total_pages)} • run /invite to add me!")
+    embed.set_footer(text=footer_text)
     return [embed]
 
 class ModSelect(discord.ui.Select):
@@ -370,12 +337,16 @@ class ModSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
+        
+        start = time.perf_counter()
         mod_data = await interaction.client.fetch_single_mod(self.values[0])
+        ms = (time.perf_counter() - start) * 1000
+        show_invite = random.random() < 0.15
         
         if "error" in mod_data:
             return await interaction.followup.send(f"ah man, ran into an issue fetching that mod: {mod_data['error']}", ephemeral=True)
             
-        await interaction.followup.send(embed=build_single_mod_embed(mod_data), view=NotifyView(), ephemeral=True)
+        await interaction.followup.send(embed=build_single_mod_embed(mod_data, ms, show_invite), view=NotifyView(), ephemeral=True)
 
 class PageModal(discord.ui.Modal, title="jump to page"):
     page_num = discord.ui.TextInput(label="page number", style=discord.TextStyle.short, placeholder="enter a page...", required=True)
@@ -437,7 +408,11 @@ class ModSearchView(discord.ui.View):
         if self.mods: self.add_item(ModSelect(self.mods))
 
     async def generate_view(self):
+        start = time.perf_counter()
         await self.load_data()
+        ms = (time.perf_counter() - start) * 1000
+        show_invite = random.random() < 0.15
+        
         self.update_items()
         
         titles = {
@@ -451,7 +426,7 @@ class ModSearchView(discord.ui.View):
         if self.platform: title += f" | {self.platform}"
         if self.tag: title += f" | tag: {self.tag}"
         
-        return build_list_embeds(title, self.mods, self.page, self.total_pages, self.per_page, self.total_mods)
+        return build_list_embeds(title, self.mods, self.page, self.total_pages, self.per_page, self.total_mods, ms, show_invite)
 
     @discord.ui.button(label="<", style=discord.ButtonStyle.secondary, custom_id="prev")
     async def btn_prev(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -476,7 +451,6 @@ class Bot(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
         self.add_view(NotifyView())
-        load_cache_from_file()
         await self.tree.sync()
         self.refresh_all_mods_cache.start()
         self.check_mod_updates.start()
@@ -566,8 +540,7 @@ class Bot(commands.Bot):
             global _ALL_MODS_CACHE
             if all_mods:
                 _ALL_MODS_CACHE = all_mods
-                save_cache_to_file()
-                rebuild_fast_index()
+                log.info(f"refreshed in-memory cache with {len(_ALL_MODS_CACHE)} mods.")
         except Exception as e:
             log.warning(f"cache pipeline exception: {e}")
 
@@ -591,7 +564,7 @@ class Bot(commands.Bot):
 
                     latest_v = find_version(mod_resp) or data["version"]
                     if latest_v != data["version"]:
-                        embed = build_single_mod_embed(mod_resp)
+                        embed = build_single_mod_embed(mod_resp, ms_time=0.0, show_invite=False)
                         
                         for uid in data["users"]:
                             try:
@@ -634,13 +607,12 @@ async def mod_autocomplete_logic(current: str):
         
     current_lower = current.lower()
     
-    # fast o(1) lookup map for prefix matches
-    if current_lower in _INDEX_MAP:
-        local_matches = _INDEX_MAP[current_lower]
-        return [discord.app_commands.Choice(name=f"{m['name']} ({m['id']})", value=m['id']) for m in local_matches][:25]
-        
-    # fallback searching
-    local_matches = [m for m in _ALL_MODS_CACHE if current_lower in m["id"].lower() or current_lower in m["name"].lower()]
+    # fast native substring check replaces the map logic
+    local_matches = [
+        m for m in _ALL_MODS_CACHE 
+        if current_lower in m["id"].lower() or current_lower in m["name"].lower()
+    ]
+    
     return [discord.app_commands.Choice(name=f"{m['name']} ({m['id']})", value=m['id']) for m in local_matches][:25]
 
 # --- commands ---
@@ -667,10 +639,14 @@ async def checkforupdates(interaction: discord.Interaction, mod_id: Optional[str
     await interaction.response.defer()
 
     if mod_id:
+        start = time.perf_counter()
         mod_data = await bot.fetch_single_mod(mod_id)
+        ms = (time.perf_counter() - start) * 1000
+        show_invite = random.random() < 0.15
+        
         if "error" in mod_data:
             return await interaction.followup.send(f"ah, {mod_data['error']}")
-        await interaction.followup.send(embed=build_single_mod_embed(mod_data), view=NotifyView())
+        await interaction.followup.send(embed=build_single_mod_embed(mod_data, ms, show_invite), view=NotifyView())
     else:
         view = ModSearchView(
             bot, 
@@ -688,7 +664,6 @@ async def checkforupdates_mod_autocomplete(interaction: discord.Interaction, cur
 
 @bot.tree.command(name="invite", description="add this bot to your own servers!")
 async def invite_cmd(interaction: discord.Interaction):
-    # dynamic client id pulling so it works instantly on your end
     link = f"https://discord.com/oauth2/authorize?client_id={bot.user.id}&permissions=274877975552&scope=bot%20applications.commands"
     embed = discord.Embed(
         title="put me in your server!",
@@ -737,7 +712,11 @@ async def erymanthus(interaction: discord.Interaction, search: str, max_results:
         return await interaction.response.send_message("nah, let's keep the language clean.", ephemeral=True)
 
     await interaction.response.defer()
+    
+    start = time.perf_counter()
     data = await bot.fetch_mods_list(query=search, sort="downloads", page=1, per_page=max_results)
+    ms = (time.perf_counter() - start) * 1000
+    
     mods = data.get("data", [])
 
     if not mods:
@@ -750,6 +729,7 @@ async def erymanthus(interaction: discord.Interaction, search: str, max_results:
 
     embed.description += "\n*note: this just checks titles and descriptions.*"
     embed.set_author(name=f"total mods checked: {data.get('count', 0):,}")
+    embed.set_footer(text=f"⏱️ {ms:.1f}ms")
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="dev", description="dev tools for geode")
@@ -765,17 +745,20 @@ async def dev(interaction: discord.Interaction, command: discord.app_commands.Ch
     if cmd == "repo":
         if not mod_id: return await interaction.response.send_message("gonna need a `mod_id` for that to work.", ephemeral=True)
         await interaction.response.defer()
+        
+        start = time.perf_counter()
         try:
             async with bot.session.get(api_url.format(mod_id)) as r:
+                ms = (time.perf_counter() - start) * 1000
                 if r.status == 200:
                     mod_obj = normalize_single_mod_response(await r.json())
                     links = mod_obj.get("links", {})
                     src = links.get("source") or links.get("repository") or mod_obj.get("repository") or mod_obj.get("source")
-                    await interaction.followup.send(f"**source for `{mod_id}`:**\n{src}" if src else f"couldn't find a repo link for `{mod_id}`.")
+                    await interaction.followup.send(f"**source for `{mod_id}`:**\n{src}\n*(took {ms:.1f}ms)*" if src else f"couldn't find a repo link for `{mod_id}`. *(took {ms:.1f}ms)*")
                 elif r.status == 404:
-                    await interaction.followup.send(f"doesn't look like mod `{mod_id}` exists.")
+                    await interaction.followup.send(f"doesn't look like mod `{mod_id}` exists. *(took {ms:.1f}ms)*")
                 else:
-                    await interaction.followup.send(f"api is being a bit weird right now: http {r.status}")
+                    await interaction.followup.send(f"api is being a bit weird right now: http {r.status} *(took {ms:.1f}ms)*")
         except Exception as e:
             await interaction.followup.send(f"ran into a snag grabbing the repo: {format_error_reason(e)}")
 
