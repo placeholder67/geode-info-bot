@@ -17,6 +17,11 @@ cf_account = os.getenv("CF_ACCOUNT_ID")
 cf_db = os.getenv("CF_DATABASE_ID")
 cf_token = os.getenv("CF_API_TOKEN")
 
+print("token:", token)
+print("account:", cf_account)
+print("db:", cf_db)
+print("cf token:", cf_token)
+
 api_url = "https://api.geode-sdk.org/v1/mods/{}"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
