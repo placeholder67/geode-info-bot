@@ -5,8 +5,9 @@ import re
 import random
 import string
 import time
+import base64
 from datetime import datetime, timezone
-from typing import Any, Optional, Dict, Tuple, List
+from typing import Any, Optional, Dict, Tuple, List, Union
 
 import aiohttp
 import discord
@@ -36,6 +37,13 @@ _TAGS_CACHE: List[str] = [
     "performance", "customization", "content", "developer", 
     "cheat", "paid", "joke"
 ]
+
+_PENDING_TRACKS: Dict[str, str] = {}
+
+def cache_pending_track(track_id: str) -> str:
+    nonce = "".join(random.choices(string.ascii_letters + string.digits, k=8))
+    _PENDING_TRACKS[nonce] = track_id
+    return nonce
 
 def get_cached_response(key: str):
     if key in _API_CACHE:
@@ -113,9 +121,26 @@ class D1Tracker:
             return {}
 
     async def add_tracking(self, session: aiohttp.ClientSession, mods: str, version: str, track_id: str) -> bool:
+        if track_id.startswith("guild:"):
+            parts = track_id.split(":")
+            if len(parts) >= 4:
+                # Stop double rows by updating if a tracking instance for this specific channel already exists
+                prefix = f"{parts[0]}:{parts[1]}:{parts[2]}:{parts[3]}:%"
+                check_sql = "SELECT * FROM tracking WHERE mods = ? AND id LIKE ?"
+                res = await self.query(session, check_sql, [mods, prefix])
+                
+                results = res.get("result", [{}])[0].get("results", [])
+                if results:
+                    old_id = results[0]["id"]
+                    if old_id == track_id:
+                        return False
+                    
+                    upd_sql = "UPDATE tracking SET id = ? WHERE mods = ? AND id = ?"
+                    await self.query(session, upd_sql, [track_id, mods, old_id])
+                    return True 
+
         check_sql = "SELECT * FROM tracking WHERE mods = ? AND id = ?"
         res = await self.query(session, check_sql, [mods, track_id])
-        
         results = res.get("result", [{}])[0].get("results", [])
         if results: return False
 
@@ -126,6 +151,12 @@ class D1Tracker:
     async def remove_tracking(self, session: aiohttp.ClientSession, mods: str, track_id: str) -> bool:
         del_sql = "DELETE FROM tracking WHERE mods = ? AND id = ? RETURNING *"
         res = await self.query(session, del_sql, [mods, track_id])
+        return len(res.get("result", [{}])[0].get("results", [])) > 0
+        
+    async def remove_tracking_prefix(self, session: aiohttp.ClientSession, mods: str, guild_id: int, channel_id: str) -> bool:
+        prefix = f"guild:{guild_id}:channel:{channel_id}:%"
+        del_sql = "DELETE FROM tracking WHERE mods = ? AND id LIKE ? RETURNING *"
+        res = await self.query(session, del_sql, [mods, prefix])
         return len(res.get("result", [{}])[0].get("results", [])) > 0
 
     async def get_user_tracked_mods(self, session: aiohttp.ClientSession, track_id: str) -> list:
@@ -380,10 +411,10 @@ class StatefulPageModal(discord.ui.Modal, title="jump to page"):
             await interaction.response.send_message("invalid page number.", ephemeral=True)
 
 class ServerNotifySearchView(discord.ui.View):
-    def __init__(self, bot, track_id: str, query: str = None, sort_mode: str = "downloads", platform: str = None, tag: str = None, developer: str = None):
+    def __init__(self, bot, nonce: str, query: str = None, sort_mode: str = "downloads", platform: str = None, tag: str = None, developer: str = None):
         super().__init__(timeout=None)
         self.bot = bot
-        self.track_id = track_id
+        self.nonce = nonce
         self.query = query
         self.sort_mode = sort_mode
         self.platform = platform
@@ -420,7 +451,7 @@ class ServerNotifySearchView(discord.ui.View):
                 ))
             self.add_item(discord.ui.Select(
                 placeholder="pick a mod to track in the server...", min_values=1, max_values=1,
-                options=options, custom_id=f"sn_mod_select|{self.track_id}"
+                options=options, custom_id=f"sn_mod_select|{self.nonce}"
             ))
 
         base_title = "server notify search"
@@ -665,46 +696,96 @@ class Bot(commands.Bot):
         try:
             tracking_data = await tracker.get_all_tracking(self.session)
             
-            for mod_id, data in tracking_data.items():
+            for mods_val, data in tracking_data.items():
                 try:
                     if not data["users"]: continue
+                    
+                    is_tag = mods_val.startswith("tag:")
+                    is_dev = mods_val.startswith("dev:")
+                    
+                    latest_v = ""
+                    current_sig = ""
+                    embed = None
+                    mod_data_for_name = None
+                    
+                    if is_tag or is_dev:
+                        query_val = mods_val.split(":", 1)[1]
+                        if is_tag:
+                            list_data = await self.fetch_mods_list(tags=query_val, sort="recently_updated", per_page=1)
+                        else:
+                            list_data = await self.fetch_mods_list(developer=query_val, sort="recently_updated", per_page=1)
+                            
+                        mods_list = list_data.get("data", [])
+                        if not mods_list: continue
                         
-                    mod_resp = await self.fetch_single_mod(mod_id, bypass_cache=True)
-                    if "error" in mod_resp: continue
+                        latest_mod = mods_list[0]
+                        mod_data_for_name = latest_mod
+                        latest_mod_id = latest_mod.get("id", "unknown")
+                        latest_v = find_version(latest_mod) or "unknown"
+                        current_sig = f"{latest_mod_id}:{latest_v}"
+                        
+                        if current_sig != data["version"]:
+                            embed = build_single_mod_embed(latest_mod, ms_time=0.0, show_invite=False)
+                            embed.title = f"🌟 New in {mods_val}! {embed.title}"
+                    else:
+                        mod_resp = await self.fetch_single_mod(mods_val, bypass_cache=True)
+                        if "error" in mod_resp: continue
+                        mod_data_for_name = mod_resp
+                        latest_v = find_version(mod_resp) or data["version"]
+                        current_sig = latest_v
+                        
+                        if latest_v != data["version"]:
+                            embed = build_single_mod_embed(mod_resp, ms_time=0.0, show_invite=False)
 
-                    latest_v = find_version(mod_resp) or data["version"]
-                    if latest_v != data["version"]:
-                        embed = build_single_mod_embed(mod_resp, ms_time=0.0, show_invite=False)
-                        
+                    if embed: 
                         for uid in data["users"]:
                             try:
                                 uid_str = str(uid)
                                 if uid_str.startswith("guild:"):
-                                    # Format: guild:{g_id}:channel:{c_id}:ping:{p_id}
+                                    # Format: guild:{g_id}:channel:{c_id}:ping:{p_id}:msg:{msg_b64}
                                     parts = uid_str.split(":")
-                                    if len(parts) >= 6:
+                                    if len(parts) >= 8:
                                         c_id = int(parts[3])
-                                        p_id = parts[5]
+                                        
+                                        try:
+                                            ping_text = base64.urlsafe_b64decode(parts[5]).decode('utf-8')
+                                        except:
+                                            ping_text = ""
+                                            
+                                        try:
+                                            custom_msg = base64.urlsafe_b64decode(parts[7]).decode('utf-8')
+                                        except:
+                                            custom_msg = ""
+                                            
                                         channel = self.get_channel(c_id) or await self.fetch_channel(c_id)
                                         if channel:
-                                            ping_text = f"<@{p_id}> " if p_id != "none" else ""
-                                            msg_content = f"🔔 **mod updated!**\n**{find_name(mod_resp, mod_id)}** just updated to **{latest_v}**!"
-                                            if ping_text:
-                                                msg_content = f"{ping_text} {msg_content}"
+                                            ping_prefix = f"{ping_text} " if ping_text and ping_text != "none" else ""
+                                            msg_content = f"🔔 **Server Update Alert!**\n"
+                                            if custom_msg and custom_msg != "none":
+                                                msg_content += f"{custom_msg}\n\n"
+                                                
+                                            if is_tag or is_dev:
+                                                msg_content = f"{ping_prefix}{msg_content}Something new in **{mods_val}**!"
+                                            else:
+                                                msg_content = f"{ping_prefix}{msg_content}**{find_name(mod_data_for_name, mods_val)}** just updated to **{latest_v}**!"
+                                            
                                             await channel.send(msg_content, embed=embed)
                                 else:
                                     user_id = int(uid_str)
                                     user = self.get_user(user_id) or await self.fetch_user(user_id)
                                     if user:
-                                        await user.send(f"🔔 **update alert!**\n**{find_name(mod_resp, mod_id)}** just updated to **{latest_v}**!", embed=embed, view=NotifyView())
+                                        if is_tag or is_dev:
+                                            await user.send(f"🔔 **update alert!**\nsomething new in **{mods_val}**!", embed=embed, view=NotifyView())
+                                        else:
+                                            await user.send(f"🔔 **update alert!**\n**{find_name(mod_data_for_name, mods_val)}** just updated to **{latest_v}**!", embed=embed, view=NotifyView())
                             except discord.Forbidden: pass
                             except Exception as e: log.warning(f"failed update send to {uid}: {e}")
                             
                             await asyncio.sleep(0.2)
-                        
-                        await tracker.update_version(self.session, mod_id, latest_v)
+                            
+                        await tracker.update_version(self.session, mods_val, current_sig)
                 except Exception as e:
-                    log.error(f"error processing mod {mod_id} updates: {e}")
+                    log.error(f"error processing mod {mods_val} updates: {e}")
         except Exception as e:
             log.error(f"error fetching tracking data: {e}")
 
@@ -763,9 +844,13 @@ async def global_component_handler(interaction: discord.Interaction):
         values = interaction.data.get("values", [])
         if not values: return
         mod_id = values[0]
-        track_id = custom_id.split("|", 1)[1]
+        nonce = custom_id.split("|", 1)[1]
         
+        track_id = _PENDING_TRACKS.get(nonce)
         await interaction.response.defer(ephemeral=True)
+        if not track_id:
+            return await interaction.followup.send("⚠️ this menu has expired. please run the command again.", ephemeral=True)
+            
         mod_data = await bot.fetch_single_mod(mod_id)
         if "error" in mod_data:
             return await interaction.followup.send(f"failed to fetch mod: {mod_data['error']}", ephemeral=True)
@@ -775,18 +860,18 @@ async def global_component_handler(interaction: discord.Interaction):
         if added:
             await interaction.followup.send(f"✅ successfully set up server notifications for `{mod_id}`.", ephemeral=True)
         else:
-            await interaction.followup.send(f"⚠️ this configuration is already tracking `{mod_id}`.", ephemeral=True)
+            await interaction.followup.send(f"✅ updated tracking configuration for `{mod_id}`.", ephemeral=True)
             
     elif custom_id == "sn_manage_remove":
         values = interaction.data.get("values", [])
         if not values: return
         val = values[0]
-        mod_id, track_id = val.split("|", 1)
+        m_id, c_id = val.split("|", 1)
         
         await interaction.response.defer(ephemeral=True)
-        removed = await tracker.remove_tracking(bot.session, mod_id, track_id)
+        removed = await tracker.remove_tracking_prefix(bot.session, m_id, interaction.guild.id, c_id)
         if removed:
-            await interaction.followup.send(f"✅ removed server tracking for `{mod_id}`.", ephemeral=True)
+            await interaction.followup.send(f"✅ removed server tracking for `{m_id}` in <#{c_id}>.", ephemeral=True)
         else:
             await interaction.followup.send(f"⚠️ failed to remove tracking.", ephemeral=True)
 
@@ -915,7 +1000,9 @@ async def checkforupdates_search_autocomplete(interaction: discord.Interaction, 
 @discord.app_commands.describe(
     action="add or manage server notifications",
     channel="channel to send updates in (required for add)",
-    ping="member to ping on update (optional for add)",
+    ping="member or role to ping on update (optional for add)",
+    custom_message="custom message to attach (optional for add)",
+    track_entire="track the entire tag/developer from your search",
     sort_by="sort or filter mode", 
     search="search query, tag, platform, or developer name", 
     mod_id="specific mod to view"
@@ -938,7 +1025,9 @@ async def servernotify_cmd(
     interaction: discord.Interaction, 
     action: discord.app_commands.Choice[str],
     channel: Optional[discord.TextChannel] = None,
-    ping: Optional[discord.Member] = None,
+    ping: Optional[Union[discord.Member, discord.Role]] = None,
+    custom_message: Optional[str] = None,
+    track_entire: bool = False,
     sort_by: Optional[discord.app_commands.Choice[str]] = None, 
     search: Optional[str] = None, 
     mod_id: Optional[str] = None
@@ -961,15 +1050,24 @@ async def servernotify_cmd(
             return await interaction.followup.send("this server doesn't have any active notifications.", ephemeral=True)
             
         options = []
-        for m_id, t_id in guild_tracks[:25]:
+        unique_channels_per_mod = set()
+        
+        for m_id, t_id in guild_tracks:
             parts = t_id.split(":")
             c_id = parts[3]
-            options.append(discord.SelectOption(
-                label=f"remove: {m_id}"[:100],
-                description=f"in channel {c_id}"[:100],
-                value=f"{m_id}|{t_id}"[:100]
-            ))
+            sig = f"{m_id}|{c_id}"
             
+            if sig not in unique_channels_per_mod:
+                unique_channels_per_mod.add(sig)
+                options.append(discord.SelectOption(
+                    label=f"remove: {m_id}"[:100],
+                    description=f"in channel {c_id}"[:100],
+                    value=sig[:100]
+                ))
+                
+            if len(options) >= 25:
+                break
+        
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Select(
             placeholder="select a notification to remove...",
@@ -987,8 +1085,40 @@ async def servernotify_cmd(
 
     await interaction.response.defer(ephemeral=True)
 
-    ping_id_str = str(ping.id) if ping else "none"
-    track_id = f"guild:{interaction.guild.id}:channel:{channel.id}:ping:{ping_id_str}"
+    ping_str = "none"
+    if ping:
+        if isinstance(ping, discord.Role):
+            ping_str = f"<@&{ping.id}>"
+        else:
+            ping_str = f"<@{ping.id}>"
+            
+    b64_ping = base64.urlsafe_b64encode(ping_str.encode()).decode()
+    b64_msg = base64.urlsafe_b64encode((custom_message or "none").encode()).decode()
+    
+    track_id = f"guild:{interaction.guild.id}:channel:{channel.id}:ping:{b64_ping}:msg:{b64_msg}"
+
+    if track_entire:
+        if not sort_by or not search or sort_by.value not in ("tags", "developer"):
+            return await interaction.followup.send("❌ to track an entire thing, you must set `sort_by` to 'by tag' or 'by developer' and provide a `search` query.", ephemeral=True)
+        
+        if sort_by.value == "tags":
+            mods_col = f"tag:{search.lower()}"
+            data = await bot.fetch_mods_list(tags=search, sort="recently_updated", per_page=1)
+        else:
+            mods_col = f"dev:{search.lower()}"
+            data = await bot.fetch_mods_list(developer=search, sort="recently_updated", per_page=1)
+            
+        latest_mod = data.get("data", [])
+        if not latest_mod:
+            return await interaction.followup.send("⚠️ couldn't find any mods matching that to establish a baseline.", ephemeral=True)
+            
+        version = f"{latest_mod[0].get('id', 'none')}:{find_version(latest_mod[0]) or '0'}"
+        added = await tracker.add_tracking(bot.session, mods_col, version, track_id)
+        if added:
+            await interaction.followup.send(f"✅ successfully set up notifications for the entire `{mods_col}` category in {channel.mention}.")
+        else:
+            await interaction.followup.send(f"✅ updated tracking configuration for `{mods_col}` in {channel.mention}.")
+        return
 
     if mod_id:
         mod_data = await bot.fetch_single_mod(mod_id)
@@ -1000,7 +1130,7 @@ async def servernotify_cmd(
         if added:
             await interaction.followup.send(f"✅ successfully set up notifications for `{mod_id}` in {channel.mention}.")
         else:
-            await interaction.followup.send(f"⚠️ this server is already tracking `{mod_id}` in that configuration.")
+            await interaction.followup.send(f"✅ updated tracking configuration for `{mod_id}` in {channel.mention}.")
     else:
         query = search
         sort_mode = "downloads"
@@ -1022,9 +1152,10 @@ async def servernotify_cmd(
                 developer = search
                 query = None
 
+        nonce = cache_pending_track(track_id)
         view = ServerNotifySearchView(
             bot,
-            track_id,
+            nonce,
             query=query, 
             sort_mode=sort_mode, 
             platform=platform_val,
@@ -1130,7 +1261,7 @@ async def invite_cmd(interaction: discord.Interaction):
 @discord.app_commands.describe(mod_id="the id of the mod to stop tracking")
 async def untrack_cmd(interaction: discord.Interaction, mod_id: str):
     if interaction.guild is not None:
-        return await interaction.response.send_message("❌ hop into my dms to use this!", ephemeral=True)
+        return await interaction.response.send_message("❌ hop into my dms to use this, keeps it between us.", ephemeral=True)
 
     removed = await tracker.remove_tracking(bot.session, mod_id, str(interaction.user.id))
     if removed:
